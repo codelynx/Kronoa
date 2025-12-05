@@ -157,6 +157,18 @@ try session.delete("hello/world.txt")
 
 Buffers tombstone; on `endEditing()`, writes `deleted` to `editions/10001/hello/world.txt`
 
+### Copy Operation
+
+```swift
+try session.copy(from: "articles/template.md", to: "articles/new-post.md")
+```
+
+1. Resolve source path to hash (through ancestry if needed)
+2. Buffer copy operation: `(destPath, sourceHash)`
+3. On `endEditing()`: write `sha256:{sourceHash}` to `editions/10001/articles/new-post.md`
+
+**Key benefit:** No data transfer. Since objects are content-addressed, copying just creates a new path pointing to the same hash. Works efficiently for both local filesystem and S3.
+
 ### Discard (Undo Local Change)
 
 ```swift
@@ -166,6 +178,18 @@ try session.discard("hello/world.txt")
 - If in transaction: remove from buffer
 - If already committed to edition: remove `editions/{current}/hello/world.txt`
 - File now resolves through ancestry again (restoring previous state)
+
+### Unsupported Operations
+
+| Operation | Why Not Supported |
+|-----------|-------------------|
+| Rename | S3 has no atomic rename; use `copy()` + `delete()` |
+| Move | Same as rename; use `copy()` + `delete()` |
+| Directory rename | S3 has no directories; must copy+delete each file |
+| Directory delete | Must delete each file individually |
+| Directory copy | Must copy each file individually |
+
+**S3 directory model:** S3 stores objects by key (full path). "Directories" are just common prefixes - they don't exist as entities. Operations like `rename("foo/", "bar/")` would require listing all `foo/*` keys, copying each to `bar/*`, then deleting originals. This is expensive, non-atomic, and error-prone. Clients should handle such operations explicitly.
 
 ## Publishing Workflow (PR-like Model)
 

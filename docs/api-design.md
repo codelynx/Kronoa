@@ -97,6 +97,10 @@ func write(path: String, data: Data) async throws
 /// - Throws: `invalidPath`, `readOnlyMode`
 func delete(path: String) async throws
 
+/// Copy file within the edition (server-side copy, no data transfer).
+/// - Throws: `invalidPath`, `readOnlyMode`, `notFound`
+func copy(from sourcePath: String, to destPath: String) async throws
+
 /// Discard local change to a path (editing mode only).
 /// - Throws: `invalidPath`, `readOnlyMode`
 func discard(path: String) async throws
@@ -105,6 +109,23 @@ func discard(path: String) async throws
 /// - Throws: `notInEditingMode`
 func submit(message: String) async throws
 ```
+
+### Unsupported Operations
+
+The following operations are **not supported** by design:
+
+| Operation | Reason | Alternative |
+|-----------|--------|-------------|
+| Rename file | S3 has no rename | `copy()` + `delete()` |
+| Rename directory | S3 has no directories | Copy each file + delete each file |
+| Move file | S3 has no move | `copy()` + `delete()` |
+| Directory operations | S3 uses key prefixes, not real directories | Operate on individual files |
+
+**Why no directory operations:**
+- S3 stores objects by key (path), not in directories
+- "Directories" are just common prefixes in keys
+- Renaming `foo/` to `bar/` requires copying every `foo/*` object individually
+- This is expensive and non-atomic; client should handle explicitly
 
 ### Transactional Editing
 
@@ -263,6 +284,7 @@ struct PendingChange {
 
 enum ChangeAction {
     case write(hash: String, size: Int)
+    case copy(fromHash: String, size: Int)  // server-side copy
     case delete
 }
 
