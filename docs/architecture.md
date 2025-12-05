@@ -149,6 +149,92 @@ let data = try session.read("hello/world.txt")
 6. Stop recursion if `.flattened` exists or no `.origin`
 7. If exhausted ancestry: throw `notFound` error
 
+### List Operation (Directory Listing)
+
+```swift
+// Simple iteration - client doesn't manage pagination
+for try await entry in session.list(directory: "articles/") {
+    print(entry)  // "draft.md", "images/", "post.md"
+}
+
+// Collect all entries into array
+var entries: [String] = []
+for try await entry in session.list(directory: "articles/") {
+    entries.append(entry)
+}
+// ["draft.md", "images/", "post.md"]
+```
+
+Returns an `AsyncThrowingStream<String, Error>` that yields immediate children only. Pagination is handled internally - client code is identical for local filesystem and S3.
+
+#### Algorithm
+
+1. **For each edition in ancestry chain** (current → parent → ... → flattened/root):
+   - List entries with prefix `editions/{id}/{directory}` using delimiter `/`
+   - S3: `LIST ?prefix=editions/{id}/articles/&delimiter=/`
+   - Local: `readdir(editions/{id}/articles/)`
+
+2. **Merge results**:
+   - Collect all paths across editions
+   - Child edition entries override parent (most recent wins)
+   - **Name-first shadowing**: once a name is seen, older entries are fully ignored (hash vs tombstone doesn't matter)
+   - Exclude tombstones (`deleted` entries) from final result
+
+3. **Sort and yield**:
+   - **Lexicographic order** (deterministic)
+   - Files: `"post.md"`, Subdirectories: `"images/"` (trailing slash)
+   - Yield entries one at a time via AsyncSequence
+
+#### Subdirectory Visibility
+
+Subdirectories appear only if at least one descendant survives the merge:
+- `images/` appears because `articles/images/a.jpg` exists (not tombstoned)
+- To hide a subdirectory, every file under that prefix must be tombstoned
+- There is no directory-level tombstone - directories are emergent from file prefixes
+
+#### Empty and Non-Existent Directories
+
+- `list("foo/")` where `foo/` has no entries → empty sequence
+- `list("foo/")` where `foo/` never existed → empty sequence
+- **No `notFound` error** for directories - matches S3 semantics (prefix with no keys = empty result)
+- `invalidPath` only thrown for malformed paths (contains `..`, starts with `.`, etc.)
+
+This differs from file operations: `read("foo/bar.txt")` throws `notFound` if file doesn't exist, but `list("foo/")` returns empty sequence if directory is empty/missing.
+
+#### Example with Ancestry
+
+```
+editions/10002/articles/new.md       → sha256:aaa   (current)
+editions/10002/articles/old.md       → deleted      (tombstone)
+editions/10002/articles/images/a.jpg → sha256:eee   (current)
+editions/10001/articles/post.md      → sha256:bbb   (parent)
+editions/10001/articles/old.md       → sha256:ccc   (overridden by tombstone)
+editions/10000/articles/archive.md   → sha256:ddd   (grandparent)
+
+list("articles/")
+  → yields: "archive.md", "images/", "new.md", "post.md"
+     (old.md excluded - deleted in 10002)
+     (images/ shown as subdirectory - traverse with list("articles/images/"))
+```
+
+#### Performance Considerations
+
+**Cost:** `O(entries_in_dir × ancestry_depth)` per directory - all editions must be scanned and merged before yielding.
+
+**Why full scan is required:**
+- Ancestry merge needs all entries to determine overrides and tombstones
+- Cannot yield entries until merge is complete (child edition may delete parent's entry)
+- This is inherent to the ancestry model, not a pagination limitation
+
+**Backend differences (hidden from client):**
+- **Local FS**: `readdir()` returns all entries at once → sort → yield
+- **S3**: Multiple LIST calls with continuation tokens → merge → sort → yield
+
+**Recommendations:**
+- Flatten editions periodically to reduce ancestry depth
+- Keep directories reasonably sized (hundreds, not millions)
+- Only immediate children returned - traverse subdirectories explicitly
+
 ### Delete Operation
 
 ```swift

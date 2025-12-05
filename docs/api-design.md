@@ -85,9 +85,16 @@ func exists(path: String) async throws -> Bool
 /// - Throws: `invalidPath`
 func stat(path: String) async throws -> FileStat
 
-/// List files in directory (merged from ancestry, excludes tombstones).
-/// - Throws: `invalidPath`
-func list(directory: String) async throws -> [String]
+/// List immediate children of a directory (merged from ancestry, excludes tombstones).
+/// Returns AsyncThrowingStream - pagination handled internally.
+/// - Parameter directory: Directory path (e.g., "articles/") or "" for root
+/// - Returns: AsyncThrowingStream yielding entry names in lexicographic order
+/// - Throws: `invalidPath` for malformed paths (thrown when iteration starts)
+/// - Note: Returns empty sequence for non-existent or empty directories (no `notFound` error).
+/// - Note: Only lists immediate children. To traverse subdirectories, call list() on each.
+/// - Warning: First `await` may block until full ancestry merge completes. Items are not
+///   streamed lazily from backend - all editions must be scanned before yielding begins.
+func list(directory: String) -> AsyncThrowingStream<String, Error>
 
 /// Write file content (editing mode only, buffered until endEditing).
 /// - Throws: `invalidPath`, `readOnlyMode`
@@ -469,6 +476,41 @@ try await admin.deploy()
 
 // 6. Previous staging work (10005) now needs rebase
 // Editor must re-checkout from 10006 and re-apply their changes
+```
+
+### Listing Directory Contents
+
+```swift
+// Simple iteration - pagination handled internally
+for try await entry in session.list(directory: "articles/") {
+    print(entry)  // "draft.md", "images/", "post.md"
+}
+// Note: directories have trailing /, files don't
+
+// Collect all entries into array
+var entries: [String] = []
+for try await entry in session.list(directory: "articles/") {
+    entries.append(entry)
+}
+// ["draft.md", "images/", "post.md"]  ← lexicographically sorted
+
+// Non-existent or empty directory returns empty sequence (not an error)
+var empty: [String] = []
+for try await entry in session.list(directory: "nonexistent/") {
+    empty.append(entry)
+}
+// []  ← matches S3 semantics
+
+// Process entries (same API for local and S3)
+for try await entry in session.list(directory: "logs/") {
+    await processEntry(entry)
+}
+
+// WARNING: First await blocks until ancestry merge completes.
+// All editions are scanned before any items yield.
+
+// Results are merged from ancestry, de-duplicated, tombstones excluded
+// Only immediate children - traverse subdirectories by calling list() on each
 ```
 
 ### Using stat() for Metadata
