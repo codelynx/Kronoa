@@ -208,6 +208,13 @@ func setStagingPointer(to edition: Int) async throws
 /// Reject a submission with reason.
 func reject(edition: Int, reason: String) async throws
 
+/// List all rejected submissions.
+func listRejected() async throws -> [RejectedSubmission]
+
+/// Get rejection record for a specific edition.
+/// - Returns: Rejection record, or nil if not found
+func getRejection(edition: Int) async throws -> RejectedSubmission?
+
 /// Flatten an edition (copies all ancestor mappings, long operation with lock renewal).
 /// - Throws: `lockTimeout`, `lockExpired`
 func flatten(edition: Int) async throws

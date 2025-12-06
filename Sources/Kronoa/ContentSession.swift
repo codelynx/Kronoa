@@ -834,6 +834,63 @@ public actor ContentSession {
         return submissions.sorted { $0.edition < $1.edition }
     }
 
+    /// List all rejected submissions.
+    /// - Returns: Array of rejected submissions, sorted by edition ID
+    public func listRejected() async throws -> [RejectedSubmission] {
+        let rejectedPrefix = "\(contentsPrefix).rejected/"
+
+        let keys: [String]
+        do {
+            keys = try await storage.list(prefix: rejectedPrefix, delimiter: nil)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var rejections: [RejectedSubmission] = []
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        for key in keys {
+            guard key.hasSuffix(".json") else { continue }
+
+            do {
+                let data = try await storage.read(path: key)
+                let rejection = try decoder.decode(RejectedSubmission.self, from: data)
+                rejections.append(rejection)
+            } catch {
+                // Skip corrupt files
+                continue
+            }
+        }
+
+        return rejections.sorted { $0.edition < $1.edition }
+    }
+
+    /// Get rejection record for a specific edition.
+    /// - Parameter edition: Edition ID to look up
+    /// - Returns: Rejection record, or nil if not found
+    /// - Throws: `ContentError.rejectedCorrupt` if file exists but JSON is invalid
+    public func getRejection(edition: Int) async throws -> RejectedSubmission? {
+        let rejectedPath = "\(contentsPrefix).rejected/\(edition).json"
+
+        let data: Data
+        do {
+            data = try await storage.read(path: rejectedPath)
+        } catch StorageError.notFound {
+            return nil
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        do {
+            return try decoder.decode(RejectedSubmission.self, from: data)
+        } catch {
+            throw ContentError.rejectedCorrupt(edition: edition, reason: error.localizedDescription)
+        }
+    }
+
     /// Accept a submission into staging.
     /// Validates pending exists, checks for conflicts, updates .ref files, updates staging pointer.
     /// - Parameter edition: Edition ID to stage

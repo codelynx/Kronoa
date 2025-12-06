@@ -32,6 +32,9 @@ public enum ContentError: Error, Equatable {
     /// .pending/{edition}.json exists but JSON is invalid
     case pendingCorrupt(edition: Int, reason: String)
 
+    /// .rejected/{edition}.json exists but JSON is invalid
+    case rejectedCorrupt(edition: Int, reason: String)
+
     /// Pending base doesn't match current staging/production
     case conflictDetected(base: Int, current: Int, source: CheckoutSource)
 

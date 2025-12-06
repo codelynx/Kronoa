@@ -1687,6 +1687,80 @@ struct ContentSessionTests {
         }
     }
 
+    @Test("listRejected returns rejected submissions")
+    func listRejectedReturnsRejections() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and reject two submissions
+        let editor1 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor1.checkout(label: "reject1")
+        let edition1 = await editor1.editionId
+        try await editor1.write(path: "test1.txt", data: "content1".data(using: .utf8)!)
+        try await editor1.submit(message: "First")
+
+        let editor2 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor2.checkout(label: "reject2")
+        let edition2 = await editor2.editionId
+        try await editor2.write(path: "test2.txt", data: "content2".data(using: .utf8)!)
+        try await editor2.submit(message: "Second")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.reject(edition: edition1, reason: "Bad format")
+        try await admin.reject(edition: edition2, reason: "Duplicate content")
+
+        // List rejections
+        let rejections = try await admin.listRejected()
+        #expect(rejections.count == 2)
+        #expect(rejections[0].edition == edition1)
+        #expect(rejections[0].reason == "Bad format")
+        #expect(rejections[1].edition == edition2)
+        #expect(rejections[1].reason == "Duplicate content")
+    }
+
+    @Test("getRejection returns rejection for specific edition")
+    func getRejectionReturnsRejection() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and reject a submission
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "get-reject")
+        let editionId = await editor.editionId
+        try await editor.write(path: "test.txt", data: "content".data(using: .utf8)!)
+        try await editor.submit(message: "Test")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.reject(edition: editionId, reason: "Test rejection")
+
+        // Get specific rejection
+        let rejection = try await admin.getRejection(edition: editionId)
+        #expect(rejection != nil)
+        #expect(rejection?.edition == editionId)
+        #expect(rejection?.reason == "Test rejection")
+
+        // Non-existent rejection returns nil
+        let missing = try await admin.getRejection(edition: 99999)
+        #expect(missing == nil)
+    }
+
+    @Test("getRejection throws for corrupt rejection file")
+    func getRejectionThrowsForCorrupt() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Write corrupt JSON to .rejected/
+        try await storage.write(
+            path: "contents/.rejected/12345.json",
+            data: "not valid json".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        await #expect(throws: ContentError.self) {
+            _ = try await session.getRejection(edition: 12345)
+        }
+    }
+
     @Test("GC collects live editions correctly")
     func gcCollectsLiveEditions() async throws {
         defer { cleanup() }
