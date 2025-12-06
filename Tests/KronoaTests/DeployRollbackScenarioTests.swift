@@ -1,4 +1,5 @@
-import XCTest
+import Testing
+import Foundation
 @testable import Kronoa
 
 /// Simulates the Kronoa storage layout and demonstrates how a viewer session
@@ -6,19 +7,15 @@ import XCTest
 ///
 /// This test uses raw storage operations to simulate what ContentSession would do,
 /// showing the viewer's perspective of content changes.
-final class DeployRollbackScenarioTests: XCTestCase {
-    var storage: LocalFileStorage!
-    var tempDir: URL!
+@Suite struct DeployRollbackScenarioTests {
+    var storage: LocalFileStorage
+    var tempDir: URL
 
-    override func setUp() async throws {
+    init() throws {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("kronoa-scenario-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         storage = LocalFileStorage(root: tempDir)
-    }
-
-    override func tearDown() async throws {
-        try? FileManager.default.removeItem(at: tempDir)
     }
 
     // MARK: - Helpers to simulate Kronoa operations
@@ -117,9 +114,9 @@ final class DeployRollbackScenarioTests: XCTestCase {
         try await simulateStage(edition: edition)
     }
 
-    // MARK: - Scenario Test
+    // MARK: - Scenario Tests
 
-    func testViewerSeesContentChangeThroughDeployRollbackHotfix() async throws {
+    @Test func viewerSeesContentChangeThroughDeployRollbackHotfix() async throws {
         // ===== SETUP =====
         try await simulateSetup()
 
@@ -134,11 +131,10 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // ----- Viewer Session A: sees Version 1 -----
         let viewerEditionA = try await getProductionEdition()
-        XCTAssertEqual(viewerEditionA, 10001)
+        #expect(viewerEditionA == 10001)
 
         let contentA = try await readAsViewer(edition: viewerEditionA, path: "article.txt")
-        XCTAssertEqual(contentA, "Version 1: Hello World")
-        print("Viewer A sees: \(contentA)")
+        #expect(contentA == "Version 1: Hello World")
 
         // ===== EDITION 10002: Update (will be buggy) =====
         _ = try await storage.atomicIncrement(path: "editions/.head", initialValue: 10000)
@@ -151,11 +147,10 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // ----- Viewer Session B: sees buggy Version 2 -----
         let viewerEditionB = try await getProductionEdition()
-        XCTAssertEqual(viewerEditionB, 10002)
+        #expect(viewerEditionB == 10002)
 
         let contentB = try await readAsViewer(edition: viewerEditionB, path: "article.txt")
-        XCTAssertEqual(contentB, "Version 2: BUGGY CONTENT!")
-        print("Viewer B sees: \(contentB) <- BUG!")
+        #expect(contentB == "Version 2: BUGGY CONTENT!")
 
         // ===== ROLLBACK to 10001 =====
         try await simulateRollbackStaging(to: 10001)
@@ -163,11 +158,10 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // ----- Viewer Session C: sees Version 1 again (rolled back) -----
         let viewerEditionC = try await getProductionEdition()
-        XCTAssertEqual(viewerEditionC, 10001)
+        #expect(viewerEditionC == 10001)
 
         let contentC = try await readAsViewer(edition: viewerEditionC, path: "article.txt")
-        XCTAssertEqual(contentC, "Version 1: Hello World")
-        print("Viewer C sees: \(contentC) <- Rolled back!")
+        #expect(contentC == "Version 1: Hello World")
 
         // ===== EDITION 10003: Hotfix =====
         _ = try await storage.atomicIncrement(path: "editions/.head", initialValue: 10000)
@@ -180,21 +174,13 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // ----- Viewer Session D: sees hotfixed Version 3 -----
         let viewerEditionD = try await getProductionEdition()
-        XCTAssertEqual(viewerEditionD, 10003)
+        #expect(viewerEditionD == 10003)
 
         let contentD = try await readAsViewer(edition: viewerEditionD, path: "article.txt")
-        XCTAssertEqual(contentD, "Version 3: Hello World (with hotfix)")
-        print("Viewer D sees: \(contentD) <- Hotfix applied!")
-
-        // ===== VERIFY: Timeline of what each viewer saw =====
-        print("\n=== Viewer Timeline ===")
-        print("Viewer A (after initial deploy):  Edition 10001 - 'Version 1: Hello World'")
-        print("Viewer B (after buggy deploy):    Edition 10002 - 'Version 2: BUGGY CONTENT!'")
-        print("Viewer C (after rollback):        Edition 10001 - 'Version 1: Hello World'")
-        print("Viewer D (after hotfix):          Edition 10003 - 'Version 3: Hello World (with hotfix)'")
+        #expect(contentD == "Version 3: Hello World (with hotfix)")
     }
 
-    func testConcurrentViewersSeeSameContent() async throws {
+    @Test func concurrentViewersSeeSameContent() async throws {
         // Setup
         try await simulateSetup()
 
@@ -206,25 +192,15 @@ final class DeployRollbackScenarioTests: XCTestCase {
         try await simulateDeploy()
 
         // Simulate multiple concurrent viewers reading the same content
-        // Each viewer independently reads production pointer and content
-        var results: [String] = []
-
-        for i in 0..<5 {
+        for _ in 0..<5 {
             let edition = try await getProductionEdition()
             let content = try await readAsViewer(edition: edition, path: "data.json")
-            results.append("Viewer \(i): edition \(edition), content: \(content)")
-        }
-
-        // All viewers should see the same content
-        print("\n=== Concurrent Viewers ===")
-        for result in results {
-            print(result)
-            XCTAssertTrue(result.contains("edition 10001"))
-            XCTAssertTrue(result.contains(#"{"value": 42}"#))
+            #expect(edition == 10001)
+            #expect(content == #"{"value": 42}"#)
         }
     }
 
-    func testViewerIsolationDuringDeploy() async throws {
+    @Test func viewerIsolationDuringDeploy() async throws {
         // Setup
         try await simulateSetup()
 
@@ -237,7 +213,7 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // Viewer starts a "session" - captures the current production edition
         let viewerSessionEdition = try await getProductionEdition()
-        XCTAssertEqual(viewerSessionEdition, 10001)
+        #expect(viewerSessionEdition == 10001)
 
         // Meanwhile, admin creates and deploys edition 10002
         _ = try await storage.atomicIncrement(path: "editions/.head", initialValue: 10000)
@@ -248,20 +224,15 @@ final class DeployRollbackScenarioTests: XCTestCase {
 
         // New production is 10002
         let newProduction = try await getProductionEdition()
-        XCTAssertEqual(newProduction, 10002)
+        #expect(newProduction == 10002)
 
         // But the original viewer session still reads from 10001 (session isolation)
-        // In real implementation, session would cache the edition at open time
         let viewerContent = try await readAsViewer(edition: viewerSessionEdition, path: "config.txt")
-        XCTAssertEqual(viewerContent, "Config V1")
+        #expect(viewerContent == "Config V1")
 
         // A new viewer would see 10002
         let newViewerEdition = try await getProductionEdition()
         let newViewerContent = try await readAsViewer(edition: newViewerEdition, path: "config.txt")
-        XCTAssertEqual(newViewerContent, "Config V2")
-
-        print("\n=== Session Isolation ===")
-        print("Original viewer (started before deploy): sees 'Config V1' from edition 10001")
-        print("New viewer (started after deploy): sees 'Config V2' from edition 10002")
+        #expect(newViewerContent == "Config V2")
     }
 }
