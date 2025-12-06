@@ -194,6 +194,17 @@ func stage(edition: Int) async throws
 /// - Throws: `lockTimeout`, `lockExpired`
 func deploy() async throws
 
+/// Set staging pointer to a previously-staged edition (for rollback).
+/// Unlike stage(), this does not require a pending record or update .ref files.
+/// Only valid for editions that were previously staged (their .ref files already exist).
+///
+/// Validation: Checks that the edition directory exists. Does NOT verify the edition
+/// was previously staged (admin responsibility). Pointing to a never-staged edition
+/// would leave its objects without .ref entries, making them GC candidates.
+///
+/// - Throws: `editionNotFound`, `lockTimeout`, `lockExpired`
+func setStagingPointer(to edition: Int) async throws
+
 /// Reject a submission with reason.
 func reject(edition: Int, reason: String) async throws
 
@@ -231,6 +242,10 @@ enum ContentError: Error {
 
     /// beginEditing called while already in transaction
     case alreadyInTransaction
+
+    // Edition errors
+    /// Edition directory does not exist
+    case editionNotFound(edition: Int)
 
     // Staging errors
     /// No .pending/{edition}.json file found
@@ -730,6 +745,7 @@ class S3Lock: LockHandle {
 | submit | No | No |
 | stage | Yes | Yes (long operation) |
 | deploy | Yes | Yes (if S3 slow) |
+| setStagingPointer | Yes | Yes (if S3 slow) |
 | reject | No | No |
 | flatten | Yes | Yes (long operation) |
 | gc | Yes | Yes (long operation) |
