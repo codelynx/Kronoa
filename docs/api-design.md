@@ -213,9 +213,10 @@ func reject(edition: Int, reason: String) async throws
 func flatten(edition: Int) async throws
 
 /// Run garbage collection using .ref files with fallback scan.
-/// - Parameter olderThan: Grace period - only delete objects older than this (default 24h)
+/// - Parameter dryRun: When true (default), only report what would be deleted.
+///   Passing false requires mtime support (not yet implemented) and will crash.
 /// - Throws: `lockTimeout`, `lockExpired`
-func gc(olderThan: TimeInterval = 86400) async throws -> GCResult
+func gc(dryRun: Bool = true) async throws -> GCResult
 ```
 
 ## Error Types
@@ -394,6 +395,10 @@ Simple but can still fail with `lockExpired` if S3 is slow:
 
 ### gc() Operation
 
+**Note:** Currently implemented as dry-run only. Actual deletion requires mtime support
+in `StorageBackend` which is not yet implemented. Orphaned objects are counted in
+`GCResult.skippedByAge` but not deleted.
+
 ```
 1. Build live edition set:
    - Production + ancestry
@@ -407,7 +412,7 @@ Simple but can still fail with `lockExpired` if S3 is slow:
    c. Otherwise, run fallback scan:
       - Scan all live editions for this hash
       - If found → KEEP
-      - If not found and older than grace period → DELETE
+      - If not found → count as orphan (DELETE when dryRun: false supported)
 
 3. Renew lock periodically throughout
 ```

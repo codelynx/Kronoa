@@ -109,3 +109,48 @@ public struct PendingSubmission: Codable, Equatable, Sendable {
         self.submittedAt = submittedAt
     }
 }
+
+/// Rejected submission metadata stored in .rejected/{edition}.json
+public struct RejectedSubmission: Codable, Equatable, Sendable {
+    public let edition: Int
+    public let reason: String
+    public let rejectedAt: Date
+
+    public init(edition: Int, reason: String, rejectedAt: Date) {
+        self.edition = edition
+        self.reason = reason
+        self.rejectedAt = rejectedAt
+    }
+}
+
+/// Result of garbage collection run.
+public struct GCResult: Equatable, Sendable {
+    /// Total objects scanned
+    public let scannedObjects: Int
+    /// Objects deleted (0 in dry-run mode)
+    public let deletedObjects: Int
+    /// Objects kept via .ref fast path (live edition found in ref)
+    public let skippedByRef: Int
+    /// Objects kept via fallback scan (found in live edition)
+    public let skippedByScan: Int
+    /// Orphaned objects (counted in dry-run, deleted otherwise)
+    public let skippedByAge: Int
+    /// Objects that failed to delete
+    public let errors: Int
+
+    public init(
+        scannedObjects: Int,
+        deletedObjects: Int,
+        skippedByRef: Int,
+        skippedByScan: Int,
+        skippedByAge: Int,
+        errors: Int
+    ) {
+        self.scannedObjects = scannedObjects
+        self.deletedObjects = deletedObjects
+        self.skippedByRef = skippedByRef
+        self.skippedByScan = skippedByScan
+        self.skippedByAge = skippedByAge
+        self.errors = errors
+    }
+}

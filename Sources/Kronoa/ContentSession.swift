@@ -1110,6 +1110,655 @@ public actor ContentSession {
         }
     }
 
+    // MARK: - Maintenance Operations
+
+    /// Flatten an edition by copying all ancestor mappings into it.
+    /// Creates `.flattened` marker so reads stop traversing at this edition.
+    /// - Parameter edition: Edition ID to flatten
+    /// - Throws: `ContentError.editionNotFound`, `ContentError.lockTimeout`, `ContentError.lockExpired`
+    public func flatten(edition: Int) async throws {
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var caughtError: Error?
+        do {
+            try await flattenWithLock(edition: edition, lock: lock)
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+        }
+
+        if let error = caughtError {
+            throw error
+        }
+    }
+
+    /// Internal flatten implementation.
+    private func flattenWithLock(edition: Int, lock: LockHandle) async throws {
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        let flattenedMarker = "\(editionPath).flattened"
+
+        // Check if edition exists
+        let originPath = "\(editionPath).origin"
+        let originExists: Bool
+        do {
+            originExists = try await storage.exists(path: originPath)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        if !originExists {
+            throw ContentError.editionNotFound(edition: edition)
+        }
+
+        // Check if already flattened (idempotent)
+        do {
+            if try await storage.exists(path: flattenedMarker) {
+                return  // Already flattened, no-op
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Collect all paths from ancestry
+        var allPaths: [String: (hash: String?, isDeleted: Bool, fromEdition: Int)] = [:]
+        var currentEdition: Int? = edition
+        var processedCount = 0
+        let renewInterval = 20
+
+        while let editionId = currentEdition {
+            let prefix = "\(editionsPrefix)\(editionId)/"
+
+            // List all files in this edition
+            let keys: [String]
+            do {
+                keys = try await storage.list(prefix: prefix, delimiter: nil)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            for key in keys {
+                if key.hasSuffix("/") { continue }
+
+                let relativePath = key.replacingOccurrences(of: prefix, with: "")
+                if relativePath.hasPrefix(".") { continue }  // Skip metadata
+
+                // Only record if not already seen (child takes precedence)
+                if allPaths[relativePath] == nil {
+                    do {
+                        let content = try await storage.read(path: key)
+                        guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                            continue
+                        }
+
+                        if text == "deleted" {
+                            allPaths[relativePath] = (hash: nil, isDeleted: true, fromEdition: editionId)
+                        } else if text.hasPrefix("sha256:") {
+                            let hash = String(text.dropFirst(7))
+                            allPaths[relativePath] = (hash: hash, isDeleted: false, fromEdition: editionId)
+                        }
+
+                        processedCount += 1
+                        if processedCount % renewInterval == 0 {
+                            do {
+                                try await lock.renew(duration: 60)
+                            } catch {
+                                throw ContentError.lockExpired
+                            }
+                        }
+                    } catch StorageError.notFound {
+                        continue
+                    } catch let error as StorageError {
+                        throw ContentError.storageError(underlying: error)
+                    }
+                }
+            }
+
+            // Check for .flattened marker to stop traversal
+            let ancestorFlattenedPath = "\(prefix).flattened"
+            do {
+                if try await storage.exists(path: ancestorFlattenedPath) {
+                    break  // Stop at flattened ancestor
+                }
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            // Move to parent
+            currentEdition = try await getParentEdition(editionId)
+        }
+
+        // Write all collected paths to the target edition (if not from this edition already)
+        for (path, info) in allPaths {
+            if info.fromEdition == edition { continue }  // Already in this edition
+
+            let targetPath = "\(editionPath)\(path)"
+            let content: String
+            if info.isDeleted {
+                content = "deleted"
+            } else if let hash = info.hash {
+                content = "sha256:\(hash)"
+            } else {
+                continue
+            }
+
+            do {
+                try await storage.write(path: targetPath, data: content.data(using: .utf8)!)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            processedCount += 1
+            if processedCount % renewInterval == 0 {
+                do {
+                    try await lock.renew(duration: 60)
+                } catch {
+                    throw ContentError.lockExpired
+                }
+            }
+        }
+
+        // Create .flattened marker
+        do {
+            try await storage.write(path: flattenedMarker, data: Data())
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Get parent edition ID from .origin file.
+    /// - Returns: Parent edition ID, or nil for genesis edition (no .origin file)
+    /// - Throws: `ContentError.integrityError` for malformed .origin content
+    private func getParentEdition(_ edition: Int) async throws -> Int? {
+        let originPath = "\(editionsPrefix)\(edition)/.origin"
+        do {
+            let data = try await storage.read(path: originPath)
+            guard let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw ContentError.integrityError(
+                    expected: "valid UTF-8 integer",
+                    actual: "invalid UTF-8 data in \(originPath)"
+                )
+            }
+            guard let parentId = Int(text) else {
+                throw ContentError.integrityError(
+                    expected: "integer",
+                    actual: "'\(text)' in \(originPath)"
+                )
+            }
+            return parentId
+        } catch StorageError.notFound {
+            return nil  // Genesis edition
+        } catch let error as ContentError {
+            throw error
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Set staging pointer to a previously-staged edition (for rollback).
+    /// Unlike stage(), this does not require a pending record or update .ref files.
+    /// - Parameter edition: Edition ID to set as staging
+    /// - Throws: `ContentError.editionNotFound`, `ContentError.lockTimeout`, `ContentError.lockExpired`
+    /// - Warning: Only use for editions that were previously staged. Their objects are already
+    ///   tracked in .ref files from the original staging operation.
+    public func setStagingPointer(to edition: Int) async throws {
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var caughtError: Error?
+        do {
+            try await setStagingPointerWithLock(to: edition)
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+        }
+
+        if let error = caughtError {
+            throw error
+        }
+    }
+
+    /// Internal setStagingPointer implementation.
+    private func setStagingPointerWithLock(to edition: Int) async throws {
+        // Validate edition exists
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        let originPath = "\(editionPath).origin"
+
+        let exists: Bool
+        do {
+            exists = try await storage.exists(path: originPath)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        if !exists {
+            throw ContentError.editionNotFound(edition: edition)
+        }
+
+        // Update staging pointer
+        let pointer = EditionPointer(edition: edition)
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(pointer)
+
+        do {
+            try await storage.write(path: "\(contentsPrefix).staging.json", data: data)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Reject a pending submission.
+    /// Removes from .pending/ and stores rejection record in .rejected/
+    /// - Parameters:
+    ///   - edition: Edition ID to reject
+    ///   - reason: Reason for rejection
+    /// - Throws: `ContentError.pendingNotFound`, `ContentError.lockTimeout`, `ContentError.lockExpired`
+    public func reject(edition: Int, reason: String) async throws {
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var caughtError: Error?
+        do {
+            try await rejectWithLock(edition: edition, reason: reason)
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+        }
+
+        if let error = caughtError {
+            throw error
+        }
+    }
+
+    /// Internal reject implementation.
+    private func rejectWithLock(edition: Int, reason: String) async throws {
+        let pendingPath = "\(contentsPrefix).pending/\(edition).json"
+
+        // Verify pending exists
+        do {
+            if try await !storage.exists(path: pendingPath) {
+                throw ContentError.pendingNotFound(edition: edition)
+            }
+        } catch let error as ContentError {
+            throw error
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Create rejection record
+        let rejection = RejectedSubmission(
+            edition: edition,
+            reason: reason,
+            rejectedAt: Date()
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let rejectionData = try encoder.encode(rejection)
+
+        let rejectedPath = "\(contentsPrefix).rejected/\(edition).json"
+        do {
+            try await storage.write(path: rejectedPath, data: rejectionData)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Remove pending
+        do {
+            try await storage.delete(path: pendingPath)
+        } catch StorageError.notFound {
+            // Already gone
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Run garbage collection.
+    ///
+    /// Scans all objects and classifies them as:
+    /// - `skippedByRef`: Live (found in .ref file pointing to live edition)
+    /// - `skippedByScan`: Live (found via fallback edition scan)
+    /// - `skippedByAge`: Orphaned (deleted when `dryRun: false`, counted when `dryRun: true`)
+    ///
+    /// Uses .ref files for fast path, falls back to edition scan for objects without refs.
+    ///
+    /// - Parameter dryRun: When `true` (default), only report what would be deleted without
+    ///   actually deleting. Set to `false` to perform actual deletion. **Note:** Actual deletion
+    ///   requires mtime support in `StorageBackend` which is not yet implemented - passing
+    ///   `dryRun: false` will trigger a `preconditionFailure` until then.
+    /// - Returns: Statistics about the GC run
+    /// - Throws: `ContentError.lockTimeout`, `ContentError.lockExpired`
+    public func gc(dryRun: Bool = true) async throws -> GCResult {
+        if !dryRun {
+            preconditionFailure("gc(dryRun: false) requires mtime support in StorageBackend (not yet implemented)")
+        }
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var result: GCResult?
+        var caughtError: Error?
+        do {
+            result = try await gcWithLock(lock: lock)
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+        }
+
+        if let error = caughtError {
+            throw error
+        }
+
+        return result!
+    }
+
+    /// Internal GC implementation (dry-run only until mtime support added).
+    private func gcWithLock(lock: LockHandle) async throws -> GCResult {
+        // 1. Collect live editions
+        let liveEditions = try await collectLiveEditions()
+
+        // 2. Scan all objects
+        var scanned = 0
+        var deleted = 0
+        var skippedByRef = 0
+        var skippedByScan = 0
+        var skippedByAge = 0
+        var errors = 0
+
+        let renewInterval = 20
+        var processedCount = 0
+
+        // List all shards
+        let shards: [String]
+        do {
+            shards = try await storage.list(prefix: objectsPrefix, delimiter: "/")
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        for shard in shards {
+            guard shard.hasSuffix("/") else { continue }
+
+            // List objects in shard
+            let objects: [String]
+            do {
+                objects = try await storage.list(prefix: shard, delimiter: nil)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            for objectPath in objects {
+                guard objectPath.hasSuffix(".dat") else { continue }
+
+                scanned += 1
+                processedCount += 1
+
+                if processedCount % renewInterval == 0 {
+                    do {
+                        try await lock.renew(duration: 60)
+                    } catch {
+                        throw ContentError.lockExpired
+                    }
+                }
+
+                // Extract hash from path
+                let filename = objectPath.split(separator: "/").last!
+                let hash = String(filename.dropLast(4))  // Remove .dat
+
+                // Check .ref file first (fast path)
+                let refPath = shard + hash + ".ref"
+                var isLive = false
+
+                do {
+                    let refData = try await storage.read(path: refPath)
+                    if let content = String(data: refData, encoding: .utf8) {
+                        for line in content.split(separator: "\n") {
+                            if let editionId = Int(line.trimmingCharacters(in: .whitespaces)) {
+                                if liveEditions.contains(editionId) {
+                                    isLive = true
+                                    skippedByRef += 1
+                                    break
+                                }
+                            }
+                        }
+                    }
+                } catch StorageError.notFound {
+                    // No .ref file, will need fallback scan
+                } catch {
+                    // Corrupt ref, proceed to fallback scan
+                }
+
+                // Fallback scan if not found in ref
+                if !isLive {
+                    isLive = try await objectExistsInLiveEditions(hash: hash, liveEditions: liveEditions)
+                    if isLive {
+                        skippedByScan += 1
+                    }
+                }
+
+                // If not live, check age and delete
+                if !isLive {
+                    // Check file age (use mtime)
+                    // Note: This is a simplification - in production, we'd need storage-specific
+                    // mtime retrieval. For now, we assume objects without refs are old enough.
+                    // TODO: Add mtime support to StorageBackend
+
+                    // For safety, we'll skip age check in this implementation
+                    // and rely on the grace period being applied by the caller
+                    skippedByAge += 1  // Placeholder - needs mtime support
+
+                    // Delete object and ref
+                    // do {
+                    //     try await storage.delete(path: objectPath)
+                    //     try? await storage.delete(path: refPath)
+                    //     deleted += 1
+                    // } catch {
+                    //     errors += 1
+                    // }
+                }
+            }
+        }
+
+        return GCResult(
+            scannedObjects: scanned,
+            deletedObjects: deleted,
+            skippedByRef: skippedByRef,
+            skippedByScan: skippedByScan,
+            skippedByAge: skippedByAge,
+            errors: errors
+        )
+    }
+
+    /// Collect all live edition IDs (production, staging, pending, working + ancestry).
+    private func collectLiveEditions() async throws -> Set<Int> {
+        var liveEditions = Set<Int>()
+
+        // Production edition + ancestry
+        do {
+            let productionId = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).production.json")
+            try await collectAncestry(from: productionId, into: &liveEditions)
+        } catch {
+            // Production may not exist yet
+        }
+
+        // Staging edition + ancestry
+        do {
+            let stagingId = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).staging.json")
+            try await collectAncestry(from: stagingId, into: &liveEditions)
+        } catch {
+            // Staging may not exist yet
+        }
+
+        // Pending editions + ancestry
+        let pendingPrefix = "\(contentsPrefix).pending/"
+        do {
+            let pendingFiles = try await storage.list(prefix: pendingPrefix, delimiter: nil)
+            for file in pendingFiles {
+                guard file.hasSuffix(".json") else { continue }
+                do {
+                    let data = try await storage.read(path: file)
+                    let decoder = JSONDecoder()
+                    decoder.dateDecodingStrategy = .iso8601
+                    let submission = try decoder.decode(PendingSubmission.self, from: data)
+                    try await collectAncestry(from: submission.edition, into: &liveEditions)
+                } catch {
+                    // Skip corrupt pending files
+                }
+            }
+        } catch {
+            // No pending directory
+        }
+
+        // Working editions + ancestry
+        do {
+            let rootFiles = try await storage.list(prefix: contentsPrefix, delimiter: "/")
+            for file in rootFiles {
+                // Match .{label}.json but not .production.json, .staging.json, etc.
+                guard file.hasSuffix(".json"),
+                      !file.hasSuffix(".production.json"),
+                      !file.hasSuffix(".staging.json") else { continue }
+
+                let filename = file.split(separator: "/").last!
+                guard filename.hasPrefix(".") else { continue }
+
+                do {
+                    let data = try await storage.read(path: file)
+                    let state = try JSONDecoder().decode(SessionState.self, from: data)
+                    try await collectAncestry(from: state.edition, into: &liveEditions)
+                } catch {
+                    // Skip corrupt working files
+                }
+            }
+        } catch {
+            // No working files
+        }
+
+        return liveEditions
+    }
+
+    /// Collect edition and all its ancestors into the set.
+    private func collectAncestry(from edition: Int, into editions: inout Set<Int>) async throws {
+        var current: Int? = edition
+
+        while let editionId = current {
+            if editions.contains(editionId) {
+                break  // Already collected this branch
+            }
+            editions.insert(editionId)
+
+            // Check for .flattened marker
+            let flattenedPath = "\(editionsPrefix)\(editionId)/.flattened"
+            do {
+                if try await storage.exists(path: flattenedPath) {
+                    break  // Stop at flattened edition
+                }
+            } catch {
+                // Ignore errors, continue traversal
+            }
+
+            current = try await getParentEdition(editionId)
+        }
+    }
+
+    /// Check if an object hash exists in any live edition.
+    private func objectExistsInLiveEditions(hash: String, liveEditions: Set<Int>) async throws -> Bool {
+        for editionId in liveEditions {
+            let editionPrefix = "\(editionsPrefix)\(editionId)/"
+
+            // List all path files in edition
+            let keys: [String]
+            do {
+                keys = try await storage.list(prefix: editionPrefix, delimiter: nil)
+            } catch {
+                continue
+            }
+
+            for key in keys {
+                if key.hasSuffix("/") { continue }
+                let filename = key.replacingOccurrences(of: editionPrefix, with: "")
+                if filename.hasPrefix(".") { continue }
+
+                do {
+                    let content = try await storage.read(path: key)
+                    guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                        continue
+                    }
+
+                    if text == "sha256:\(hash)" {
+                        return true
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+
+        return false
+    }
+
     // MARK: - Private Helpers
 
     /// Write object to content-addressable storage.

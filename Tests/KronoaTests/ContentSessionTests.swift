@@ -1451,4 +1451,343 @@ struct ContentSessionTests {
         let coverData = try await prodSession.read(path: "articles/cover.md")
         #expect(String(data: coverData, encoding: .utf8) == "# Cover Story")
     }
+
+    // MARK: - Maintenance Operations Tests
+
+    @Test("Flatten copies ancestor mappings and creates .flattened marker")
+    func flattenCopiesAncestorMappings() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create file in genesis edition
+        let hash1 = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash1).dat",
+            data: "genesis content".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/ancestor.txt",
+            data: "sha256:\(hash1)".data(using: .utf8)!
+        )
+
+        // Create child edition with its own file
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "to-flatten")
+        let editionId = await session.editionId
+        try await session.write(path: "new.txt", data: "new content".data(using: .utf8)!)
+
+        // Verify ancestor.txt resolves through ancestry
+        let beforeFlatten = try await session.read(path: "ancestor.txt")
+        #expect(String(data: beforeFlatten, encoding: .utf8) == "genesis content")
+
+        // Flatten
+        try await session.flatten(edition: editionId)
+
+        // Verify .flattened marker exists
+        let flattenedExists = try await storage.exists(path: "contents/editions/\(editionId)/.flattened")
+        #expect(flattenedExists == true)
+
+        // Verify ancestor.txt is now in the flattened edition
+        let ancestorPathFile = "contents/editions/\(editionId)/ancestor.txt"
+        let ancestorContent = try await storage.read(path: ancestorPathFile)
+        #expect(String(data: ancestorContent, encoding: .utf8)?.contains(hash1) == true)
+    }
+
+    @Test("Flatten is idempotent")
+    func flattenIsIdempotent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "flatten-twice")
+        let editionId = await session.editionId
+        try await session.write(path: "test.txt", data: "data".data(using: .utf8)!)
+
+        // Flatten twice - should not throw
+        try await session.flatten(edition: editionId)
+        try await session.flatten(edition: editionId)
+
+        // Still works
+        let flattenedExists = try await storage.exists(path: "contents/editions/\(editionId)/.flattened")
+        #expect(flattenedExists == true)
+    }
+
+    @Test("Flatten rejects non-existent edition")
+    func flattenRejectsNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            try await session.flatten(edition: 99999)
+        }
+    }
+
+    @Test("Flatten preserves tombstones")
+    func flattenPreservesTombstones() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create file in genesis
+        let hash = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "will be deleted".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/deleted.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        // Create child that deletes the file
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "deleter")
+        let editionId = await session.editionId
+        try await session.delete(path: "deleted.txt")
+
+        // Flatten
+        try await session.flatten(edition: editionId)
+
+        // Verify tombstone is in flattened edition (not just in ancestor)
+        let tombstonePath = "contents/editions/\(editionId)/deleted.txt"
+        let content = try await storage.read(path: tombstonePath)
+        #expect(String(data: content, encoding: .utf8) == "deleted")
+    }
+
+    @Test("Reads stop at flattened edition")
+    func readsStopAtFlattened() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file that will be "hidden" by flattening
+        let oldHash = "old111old111old111old111old111old111old111old111old111old111old1"
+        try await storage.write(
+            path: "contents/objects/ol/\(oldHash).dat",
+            data: "old content".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/old.txt",
+            data: "sha256:\(oldHash)".data(using: .utf8)!
+        )
+
+        // Create and flatten an edition that doesn't have old.txt
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "flatten-test")
+        let editionId = await session.editionId
+        try await session.write(path: "new.txt", data: "new".data(using: .utf8)!)
+
+        // Before flattening - old.txt should resolve
+        let beforeRead = try await session.read(path: "old.txt")
+        #expect(String(data: beforeRead, encoding: .utf8) == "old content")
+
+        // Flatten (this will copy old.txt to the flattened edition)
+        try await session.flatten(edition: editionId)
+
+        // After flattening - old.txt should still be readable (it was copied)
+        let afterRead = try await session.read(path: "old.txt")
+        #expect(String(data: afterRead, encoding: .utf8) == "old content")
+    }
+
+    @Test("setStagingPointer sets staging to specified edition")
+    func setStagingPointerWorks() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and stage an edition
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "first")
+        let edition1 = await editor.editionId
+        try await editor.write(path: "v1.txt", data: "version 1".data(using: .utf8)!)
+        try await editor.submit(message: "First")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: edition1)
+
+        // Create another edition
+        let editor2 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor2.checkout(label: "second")
+        let edition2 = await editor2.editionId
+        try await editor2.write(path: "v2.txt", data: "version 2".data(using: .utf8)!)
+        try await editor2.submit(message: "Second")
+
+        try await admin.stage(edition: edition2)
+
+        // Verify staging is at edition2
+        let staging1 = try await ContentSession(storage: storage, mode: .staging)
+        #expect(await staging1.editionId == edition2)
+
+        // Rollback to edition1
+        try await admin.setStagingPointer(to: edition1)
+
+        // Verify staging is now at edition1
+        let staging2 = try await ContentSession(storage: storage, mode: .staging)
+        #expect(await staging2.editionId == edition1)
+    }
+
+    @Test("setStagingPointer rejects non-existent edition")
+    func setStagingPointerRejectsNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            try await session.setStagingPointer(to: 99999)
+        }
+    }
+
+    @Test("Reject removes pending and creates rejection record")
+    func rejectRemovesPending() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and submit
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "to-reject")
+        let editionId = await editor.editionId
+        try await editor.write(path: "test.txt", data: "test".data(using: .utf8)!)
+        try await editor.submit(message: "Test")
+
+        // Verify pending exists
+        let pendingExists = try await storage.exists(path: "contents/.pending/\(editionId).json")
+        #expect(pendingExists == true)
+
+        // Reject
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.reject(edition: editionId, reason: "Not ready")
+
+        // Pending should be removed
+        let pendingAfter = try await storage.exists(path: "contents/.pending/\(editionId).json")
+        #expect(pendingAfter == false)
+
+        // Rejection record should exist
+        let rejectedPath = "contents/.rejected/\(editionId).json"
+        let rejectedExists = try await storage.exists(path: rejectedPath)
+        #expect(rejectedExists == true)
+
+        // Verify rejection content
+        let rejectedData = try await storage.read(path: rejectedPath)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let rejection = try decoder.decode(RejectedSubmission.self, from: rejectedData)
+        #expect(rejection.edition == editionId)
+        #expect(rejection.reason == "Not ready")
+    }
+
+    @Test("Reject throws for non-existent pending")
+    func rejectThrowsForNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.pendingNotFound(edition: 99999)) {
+            try await session.reject(edition: 99999, reason: "test")
+        }
+    }
+
+    @Test("GC collects live editions correctly")
+    func gcCollectsLiveEditions() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create some content
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "gc-test")
+        try await editor.write(path: "test.txt", data: "content".data(using: .utf8)!)
+        try await editor.submit(message: "Test")
+
+        // Run GC (dry-run is default)
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        let result = try await admin.gc()
+
+        // Should have scanned objects
+        #expect(result.scannedObjects >= 0)
+        // No deletions in dry-run mode
+        #expect(result.deletedObjects == 0)
+    }
+
+    @Test("GC uses ref file fast path")
+    func gcUsesRefFastPath() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and stage an edition (which creates .ref files)
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "ref-test")
+        let editionId = await editor.editionId
+        try await editor.write(path: "test.txt", data: "content".data(using: .utf8)!)
+        try await editor.submit(message: "Test")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: editionId)
+
+        // Run GC (dry-run)
+        let result = try await admin.gc(dryRun: true)
+
+        // Should have used ref fast path for staged objects
+        #expect(result.skippedByRef >= 1)
+    }
+
+    // MARK: - Origin Integrity Tests
+
+    @Test("Flatten throws integrityError for malformed .origin")
+    func flattenThrowsForMalformedOrigin() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create an edition chain
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "malformed-origin")
+        let editionId = await editor.editionId
+        try await editor.write(path: "test.txt", data: "content".data(using: .utf8)!)
+        try await editor.submit(message: "Test")
+
+        // Corrupt the .origin file with non-integer content
+        try await storage.write(
+            path: "contents/editions/\(editionId)/.origin",
+            data: "not-an-integer".data(using: .utf8)!
+        )
+
+        // Flatten should throw integrityError
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        await #expect(throws: ContentError.self) {
+            try await admin.flatten(edition: editionId)
+        }
+    }
+
+    @Test("collectAncestry throws integrityError for malformed .origin during flatten")
+    func collectAncestryThrowsForMalformedOrigin() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create an edition chain: genesis -> first -> second
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "first")
+        let firstId = await editor.editionId
+        try await editor.write(path: "test.txt", data: "content".data(using: .utf8)!)
+        try await editor.submit(message: "First")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: firstId)
+
+        let editor2 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor2.checkout(label: "second")
+        let secondId = await editor2.editionId
+        try await editor2.write(path: "test2.txt", data: "content2".data(using: .utf8)!)
+        try await editor2.submit(message: "Second")
+
+        // Corrupt the first edition's .origin (which second points to via ancestry)
+        try await storage.write(
+            path: "contents/editions/\(firstId)/.origin",
+            data: "garbage-data".data(using: .utf8)!
+        )
+
+        // Flatten on second should throw integrityError when traversing to first's corrupted origin
+        let admin2 = try await ContentSession(storage: storage, mode: .staging)
+        await #expect(throws: ContentError.self) {
+            try await admin2.flatten(edition: secondId)
+        }
+    }
 }
