@@ -8,6 +8,9 @@ import SmithyHTTPAPI
 ///
 /// Uses AWS SDK for Swift. All paths are relative to the configured prefix.
 /// Suitable for production deployments.
+///
+/// All read operations use `responseCacheControl: "max-age=0"` to bypass
+/// SDK/HTTP layer caching that can return stale data after writes.
 public actor S3Storage: StorageBackend {
     // S3Client is thread-safe internally; nonisolated(unsafe) silences Swift 6 warnings.
     private nonisolated(unsafe) let client: S3Client
@@ -37,7 +40,12 @@ public actor S3Storage: StorageBackend {
         try PathValidation.validatePath(path)
         let key = fullKey(path)
         do {
-            let input = GetObjectInput(bucket: bucket, key: key)
+            // max-age=0 bypasses SDK/HTTP layer caching that can return stale data
+            let input = GetObjectInput(
+                bucket: bucket,
+                key: key,
+                responseCacheControl: "max-age=0"
+            )
             let output = try await client.getObject(input: input)
             guard let body = output.body else {
                 throw StorageError.notFound(path: path)
@@ -94,7 +102,12 @@ public actor S3Storage: StorageBackend {
         try PathValidation.validatePath(path)
         let key = fullKey(path)
         do {
-            let input = HeadObjectInput(bucket: bucket, key: key)
+            // max-age=0 bypasses SDK/HTTP layer caching
+            let input = HeadObjectInput(
+                bucket: bucket,
+                key: key,
+                responseCacheControl: "max-age=0"
+            )
             _ = try await client.headObject(input: input)
             return true
         } catch is AWSS3.NotFound {
@@ -167,11 +180,15 @@ public actor S3Storage: StorageBackend {
         }
 
         for attempt in 0..<maxRetries {
-            // Fresh read each attempt
+            // Fresh read each attempt (max-age=0 bypasses SDK/HTTP caching)
             var state: ObjectState = .notFound
 
             do {
-                let getInput = GetObjectInput(bucket: bucket, key: key)
+                let getInput = GetObjectInput(
+                    bucket: bucket,
+                    key: key,
+                    responseCacheControl: "max-age=0"
+                )
                 let getOutput = try await client.getObject(input: getInput)
 
                 var value = initialValue - 1
@@ -333,7 +350,12 @@ public actor S3Storage: StorageBackend {
     func readLockInfoWithETag(path: String) async throws -> (info: LockInfo, etag: String)? {
         let key = fullKey(path)
         do {
-            let getInput = GetObjectInput(bucket: bucket, key: key)
+            // max-age=0 bypasses SDK/HTTP layer caching
+            let getInput = GetObjectInput(
+                bucket: bucket,
+                key: key,
+                responseCacheControl: "max-age=0"
+            )
             let getOutput = try await client.getObject(input: getInput)
 
             guard let body = getOutput.body else {
