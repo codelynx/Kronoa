@@ -31,3 +31,4 @@ DerivedData/
 
 # Credentials
 .credentials/
+.claude/
