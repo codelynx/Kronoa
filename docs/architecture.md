@@ -37,6 +37,8 @@ root/
     ├── .staging.json         # Points to staging edition-id
     ├── .pending/             # Submitted editions awaiting review
     │   └── {edition-id}.json # Pending submission metadata
+    ├── .rejected/            # Rejected submissions
+    │   └── {edition-id}.json # Rejection record (edition, reason, rejectedAt)
     ├── .lock                 # Lock file for stage/deploy (contains lease info)
     │
     ├── editions/

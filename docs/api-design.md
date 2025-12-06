@@ -213,6 +213,7 @@ func listRejected() async throws -> [RejectedSubmission]
 
 /// Get rejection record for a specific edition.
 /// - Returns: Rejection record, or nil if not found
+/// - Throws: `rejectedCorrupt` if file exists but JSON is invalid
 func getRejection(edition: Int) async throws -> RejectedSubmission?
 
 /// Flatten an edition (copies all ancestor mappings, long operation with lock renewal).
@@ -261,6 +262,9 @@ enum ContentError: Error {
 
     /// .pending/{edition}.json exists but JSON is invalid
     case pendingCorrupt(edition: Int, reason: String)
+
+    /// .rejected/{edition}.json exists but JSON is invalid
+    case rejectedCorrupt(edition: Int, reason: String)
 
     /// Pending base doesn't match current staging/production (depending on source)
     case conflictDetected(base: Int, current: Int, source: CheckoutSource)
