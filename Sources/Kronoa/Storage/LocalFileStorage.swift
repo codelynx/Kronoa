@@ -177,43 +177,65 @@ public actor LocalFileStorage: StorageBackend {
         }
 
         do {
-            let contents = try fileManager.contentsOfDirectory(
-                at: standardizedDirURL,
-                includingPropertiesForKeys: [.isDirectoryKey]
-            )
-
             var results: [String] = []
             let standardizedRootPath = root.path
 
-            for itemURL in contents {
-                // Standardize item URL and build relative path from root
-                let standardizedItemURL = itemURL.standardizedFileURL
-                var relativePath = standardizedItemURL.path
+            if delimiter == "/" {
+                // Hierarchical listing: return immediate children only
+                let contents = try fileManager.contentsOfDirectory(
+                    at: standardizedDirURL,
+                    includingPropertiesForKeys: [.isDirectoryKey]
+                )
 
-                if relativePath.hasPrefix(standardizedRootPath) {
-                    relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
-                    if relativePath.hasPrefix("/") {
-                        relativePath = String(relativePath.dropFirst())
+                for itemURL in contents {
+                    let standardizedItemURL = itemURL.standardizedFileURL
+                    var relativePath = standardizedItemURL.path
+
+                    if relativePath.hasPrefix(standardizedRootPath) {
+                        relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
+                        if relativePath.hasPrefix("/") {
+                            relativePath = String(relativePath.dropFirst())
+                        }
                     }
-                }
 
-                // Apply prefix filter
-                guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
-                    continue
-                }
+                    guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
+                        continue
+                    }
 
-                let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-
-                if delimiter == "/" {
-                    // Hierarchical listing: return immediate children only
+                    let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
                     if isDir {
                         results.append(relativePath + "/")
                     } else {
                         results.append(relativePath)
                     }
-                } else {
-                    // Flat listing
-                    results.append(relativePath)
+                }
+            } else {
+                // Flat listing: recursively list all files
+                let enumerator = fileManager.enumerator(
+                    at: standardizedDirURL,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: []
+                )
+
+                while let itemURL = enumerator?.nextObject() as? URL {
+                    let standardizedItemURL = itemURL.standardizedFileURL
+                    var relativePath = standardizedItemURL.path
+
+                    if relativePath.hasPrefix(standardizedRootPath) {
+                        relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
+                        if relativePath.hasPrefix("/") {
+                            relativePath = String(relativePath.dropFirst())
+                        }
+                    }
+
+                    guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
+                        continue
+                    }
+
+                    let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                    if !isDir {
+                        results.append(relativePath)
+                    }
                 }
             }
 

@@ -1199,4 +1199,256 @@ struct ContentSessionTests {
 
         try await session.rollback()
     }
+
+    // MARK: - Publishing Workflow Tests
+
+    @Test("Submit creates pending file and transitions to submitted mode")
+    func submitCreatesPending() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "feature-1")
+        let editionId = await session.editionId
+
+        // Write some content
+        try await session.write(path: "test.txt", data: "content".data(using: .utf8)!)
+
+        // Submit
+        try await session.submit(message: "Test submission")
+
+        // Mode should be submitted
+        #expect(await session.mode == .submitted)
+
+        // Pending file should exist
+        let pendingData = try await storage.read(path: "contents/.pending/\(editionId).json")
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let submission = try decoder.decode(PendingSubmission.self, from: pendingData)
+
+        #expect(submission.edition == editionId)
+        #expect(submission.base == 10000)
+        #expect(submission.source == .staging)
+        #expect(submission.label == "feature-1")
+        #expect(submission.message == "Test submission")
+
+        // Working file should be removed
+        let workingExists = try await storage.exists(path: "contents/.feature-1.json")
+        #expect(workingExists == false)
+    }
+
+    @Test("Submit rejects if not in editing mode")
+    func submitRejectsReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        await #expect(throws: ContentError.notInEditingMode) {
+            try await session.submit(message: "Should fail")
+        }
+    }
+
+    @Test("Submit auto-commits pending transaction")
+    func submitAutoCommits() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "auto-commit")
+        let editionId = await session.editionId
+
+        // Start transaction but don't end it
+        try await session.beginEditing()
+        try await session.write(path: "buffered.txt", data: "data".data(using: .utf8)!)
+
+        #expect(await session.isInTransaction == true)
+
+        // Submit should auto-commit
+        try await session.submit(message: "Auto-commit test")
+
+        #expect(await session.isInTransaction == false)
+
+        // File should be written to storage
+        let pathFile = "contents/editions/\(editionId)/buffered.txt"
+        let exists = try await storage.exists(path: pathFile)
+        #expect(exists == true)
+    }
+
+    @Test("listPending returns pending submissions")
+    func listPendingReturns() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create two submissions
+        let session1 = try await ContentSession(storage: storage, mode: .staging)
+        try await session1.checkout(label: "feature-1")
+        try await session1.write(path: "a.txt", data: "A".data(using: .utf8)!)
+        try await session1.submit(message: "First")
+
+        let session2 = try await ContentSession(storage: storage, mode: .staging)
+        try await session2.checkout(label: "feature-2")
+        try await session2.write(path: "b.txt", data: "B".data(using: .utf8)!)
+        try await session2.submit(message: "Second")
+
+        // List pending
+        let reader = try await ContentSession(storage: storage, mode: .staging)
+        let pending = try await reader.listPending()
+
+        #expect(pending.count == 2)
+        #expect(pending[0].label == "feature-1")
+        #expect(pending[1].label == "feature-2")
+    }
+
+    @Test("Stage promotes pending to staging")
+    func stagePromotesPending() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and submit
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "to-stage")
+        let editionId = await editor.editionId
+        try await editor.write(path: "new.txt", data: "new content".data(using: .utf8)!)
+        try await editor.submit(message: "Ready to stage")
+
+        // Stage it
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: editionId)
+
+        // Staging should now point to new edition
+        let stagingData = try await storage.read(path: "contents/.staging.json")
+        let pointer = try JSONDecoder().decode(EditionPointer.self, from: stagingData)
+        #expect(pointer.edition == editionId)
+
+        // Pending should be removed
+        let pendingExists = try await storage.exists(path: "contents/.pending/\(editionId).json")
+        #expect(pendingExists == false)
+
+        // .ref file should exist for the object
+        let newSession = try await ContentSession(storage: storage, mode: .staging)
+        let stat = try await newSession.stat(path: "new.txt")
+        #expect(stat.status == .exists)
+
+        if let hash = stat.hash {
+            let shard = String(hash.prefix(2))
+            let refPath = "contents/objects/\(shard)/\(hash).ref"
+            let refData = try await storage.read(path: refPath)
+            let refContent = String(data: refData, encoding: .utf8)!
+            #expect(refContent.contains("\(editionId)"))
+        }
+    }
+
+    @Test("Stage rejects non-existent pending")
+    func stageRejectsNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.pendingNotFound(edition: 99999)) {
+            try await admin.stage(edition: 99999)
+        }
+    }
+
+    @Test("Stage detects conflict when base doesn't match")
+    func stageDetectsConflict() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create first submission based on 10000
+        let editor1 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor1.checkout(label: "first")
+        let edition1 = await editor1.editionId
+        try await editor1.write(path: "a.txt", data: "A".data(using: .utf8)!)
+        try await editor1.submit(message: "First")
+
+        // Create second submission also based on 10000
+        let editor2 = try await ContentSession(storage: storage, mode: .staging)
+        try await editor2.checkout(label: "second")
+        let edition2 = await editor2.editionId
+        try await editor2.write(path: "b.txt", data: "B".data(using: .utf8)!)
+        try await editor2.submit(message: "Second")
+
+        // Stage first one - should succeed
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: edition1)
+
+        // Stage second one - should fail due to conflict
+        await #expect(throws: ContentError.conflictDetected(base: 10000, current: edition1, source: .staging)) {
+            try await admin.stage(edition: edition2)
+        }
+    }
+
+    @Test("Deploy promotes staging to production")
+    func deployPromotesToProduction() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create, submit, and stage
+        let editor = try await ContentSession(storage: storage, mode: .staging)
+        try await editor.checkout(label: "to-deploy")
+        let editionId = await editor.editionId
+        try await editor.write(path: "prod.txt", data: "production content".data(using: .utf8)!)
+        try await editor.submit(message: "Ready to deploy")
+
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        try await admin.stage(edition: editionId)
+
+        // Deploy
+        try await admin.deploy()
+
+        // Production should now point to new edition
+        let prodData = try await storage.read(path: "contents/.production.json")
+        let pointer = try JSONDecoder().decode(EditionPointer.self, from: prodData)
+        #expect(pointer.edition == editionId)
+
+        // New session in production mode should see the file
+        let prodSession = try await ContentSession(storage: storage, mode: .production)
+        #expect(await prodSession.editionId == editionId)
+        let exists = try await prodSession.exists(path: "prod.txt")
+        #expect(exists == true)
+    }
+
+    @Test("Full publishing workflow")
+    func fullPublishingWorkflow() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // 1. Editor checkouts and creates content
+        let editor = try await ContentSession(storage: storage, mode: .production)
+        try await editor.checkout(label: "spring-issue", from: .staging)
+
+        try await editor.beginEditing()
+        try await editor.write(path: "articles/cover.md", data: "# Cover Story".data(using: .utf8)!)
+        try await editor.write(path: "articles/feature.md", data: "# Feature Article".data(using: .utf8)!)
+        try await editor.endEditing()
+
+        // 2. Editor submits
+        try await editor.submit(message: "Spring issue content")
+        let submittedEdition = await editor.editionId
+
+        // 3. Admin reviews pending
+        let admin = try await ContentSession(storage: storage, mode: .staging)
+        let pending = try await admin.listPending()
+        #expect(pending.count == 1)
+        #expect(pending[0].edition == submittedEdition)
+
+        // 4. Admin stages
+        try await admin.stage(edition: submittedEdition)
+
+        // Verify staging
+        let stagingSession = try await ContentSession(storage: storage, mode: .staging)
+        #expect(await stagingSession.editionId == submittedEdition)
+        #expect(try await stagingSession.exists(path: "articles/cover.md") == true)
+
+        // 5. Admin deploys
+        try await admin.deploy()
+
+        // Verify production
+        let prodSession = try await ContentSession(storage: storage, mode: .production)
+        #expect(await prodSession.editionId == submittedEdition)
+        let coverData = try await prodSession.read(path: "articles/cover.md")
+        #expect(String(data: coverData, encoding: .utf8) == "# Cover Story")
+    }
 }

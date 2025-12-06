@@ -90,3 +90,22 @@ public enum ChangeAction: Equatable, Sendable {
     /// Delete (tombstone)
     case delete
 }
+
+/// Pending submission metadata stored in .pending/{edition}.json
+public struct PendingSubmission: Codable, Equatable, Sendable {
+    public let edition: Int
+    public let base: Int
+    public let source: CheckoutSource
+    public let label: String
+    public let message: String
+    public let submittedAt: Date
+
+    public init(edition: Int, base: Int, source: CheckoutSource, label: String, message: String, submittedAt: Date) {
+        self.edition = edition
+        self.base = base
+        self.source = source
+        self.label = label
+        self.message = message
+        self.submittedAt = submittedAt
+    }
+}

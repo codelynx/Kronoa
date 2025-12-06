@@ -744,6 +744,372 @@ public actor ContentSession {
         }
     }
 
+    // MARK: - Publishing Workflow
+
+    /// Submit edition for review.
+    /// Creates `.pending/{edition}.json` with submission metadata.
+    /// Transitions mode from `.editing` to `.submitted`.
+    /// - Parameter message: Submission message describing the changes
+    /// - Throws: `ContentError.notInEditingMode`, `ContentError.storageError`
+    public func submit(message: String) async throws {
+        guard case .editing(let label) = _mode else {
+            throw ContentError.notInEditingMode
+        }
+
+        guard let baseEdition = _baseEditionId, let source = _checkoutSource else {
+            throw ContentError.notInEditingMode
+        }
+
+        // Ensure no uncommitted transaction
+        if _isInTransaction {
+            try await endEditing()
+        }
+
+        // Create pending submission record
+        let submission = PendingSubmission(
+            edition: _editionId,
+            base: baseEdition,
+            source: source,
+            label: label,
+            message: message,
+            submittedAt: Date()
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(submission)
+
+        // Write to .pending/{edition}.json
+        let pendingPath = "\(contentsPrefix).pending/\(_editionId).json"
+        do {
+            try await storage.write(path: pendingPath, data: data)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Remove working file
+        let workingFile = "\(contentsPrefix).\(label).json"
+        do {
+            try await storage.delete(path: workingFile)
+        } catch StorageError.notFound {
+            // Already gone, that's fine
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Transition to submitted mode
+        _mode = .submitted
+    }
+
+    /// List pending submissions awaiting review.
+    /// - Returns: Array of pending submissions sorted by edition ID
+    /// - Throws: `ContentError.storageError`
+    public func listPending() async throws -> [PendingSubmission] {
+        let pendingPrefix = "\(contentsPrefix).pending/"
+
+        let keys: [String]
+        do {
+            keys = try await storage.list(prefix: pendingPrefix, delimiter: nil)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var submissions: [PendingSubmission] = []
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        for key in keys {
+            guard key.hasSuffix(".json") else { continue }
+
+            do {
+                let data = try await storage.read(path: key)
+                let submission = try decoder.decode(PendingSubmission.self, from: data)
+                submissions.append(submission)
+            } catch {
+                // Skip corrupt files - they'll be caught by stage()
+                continue
+            }
+        }
+
+        return submissions.sorted { $0.edition < $1.edition }
+    }
+
+    /// Accept a submission into staging.
+    /// Validates pending exists, checks for conflicts, updates .ref files, updates staging pointer.
+    /// - Parameter edition: Edition ID to stage
+    /// - Throws: `ContentError.pendingNotFound`, `ContentError.pendingCorrupt`,
+    ///           `ContentError.conflictDetected`, `ContentError.lockTimeout`, `ContentError.lockExpired`
+    public func stage(edition: Int) async throws {
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Ensure lock is always released
+        var caughtError: Error?
+        do {
+            try await stageWithLock(edition: edition, lock: lock)
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock - propagate release failure if no prior error
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+            // If there was already an error, prioritize that over release failure
+        }
+
+        // Re-throw if there was an error
+        if let error = caughtError {
+            throw error
+        }
+    }
+
+    /// Internal stage implementation that assumes lock is held.
+    private func stageWithLock(edition: Int, lock: LockHandle) async throws {
+        let pendingPath = "\(contentsPrefix).pending/\(edition).json"
+
+        // Read and validate pending submission
+        let pendingData: Data
+        do {
+            pendingData = try await storage.read(path: pendingPath)
+        } catch StorageError.notFound {
+            throw ContentError.pendingNotFound(edition: edition)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let submission: PendingSubmission
+        do {
+            submission = try decoder.decode(PendingSubmission.self, from: pendingData)
+        } catch {
+            throw ContentError.pendingCorrupt(edition: edition, reason: error.localizedDescription)
+        }
+
+        // Verify edition's .origin matches pending metadata (guard against tampered/corrupt pending file)
+        let originPath = "\(editionsPrefix)\(edition)/.origin"
+        let actualOrigin: Int
+        do {
+            let originData = try await storage.read(path: originPath)
+            guard let originText = String(data: originData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let origin = Int(originText) else {
+                throw ContentError.pendingCorrupt(edition: edition, reason: "Invalid .origin format")
+            }
+            actualOrigin = origin
+        } catch StorageError.notFound {
+            throw ContentError.pendingCorrupt(edition: edition, reason: "Edition .origin not found")
+        } catch let error as ContentError {
+            throw error
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        if actualOrigin != submission.base {
+            throw ContentError.pendingCorrupt(
+                edition: edition,
+                reason: "Pending base (\(submission.base)) doesn't match edition .origin (\(actualOrigin))"
+            )
+        }
+
+        // Conflict check based on source
+        let currentPointer: Int
+        switch submission.source {
+        case .staging:
+            currentPointer = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).staging.json")
+        case .production:
+            currentPointer = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).production.json")
+        }
+
+        if submission.base != currentPointer {
+            throw ContentError.conflictDetected(base: submission.base, current: currentPointer, source: submission.source)
+        }
+
+        // Update .ref files for all objects in this edition
+        try await updateRefFiles(forEdition: edition, lock: lock)
+
+        // Update staging pointer
+        let stagingPointer = EditionPointer(edition: edition)
+        let encoder = JSONEncoder()
+        let pointerData = try encoder.encode(stagingPointer)
+        do {
+            try await storage.write(path: "\(contentsPrefix).staging.json", data: pointerData)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Remove pending file
+        do {
+            try await storage.delete(path: pendingPath)
+        } catch StorageError.notFound {
+            // Already gone
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Deploy staging to production.
+    /// Copies staging pointer to production pointer.
+    /// - Throws: `ContentError.lockTimeout`, `ContentError.lockExpired`, `ContentError.storageError`
+    public func deploy() async throws {
+        // Acquire lock
+        let lockPath = "\(contentsPrefix).lock"
+        let lock: LockHandle
+        do {
+            lock = try await storage.acquireLock(path: lockPath, timeout: 30, leaseDuration: 60)
+        } catch StorageError.lockTimeout {
+            throw ContentError.lockTimeout
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Ensure lock is always released
+        var caughtError: Error?
+        do {
+            try await deployWithLock()
+        } catch {
+            caughtError = error
+        }
+
+        // Always release lock - propagate release failure if no prior error
+        do {
+            try await lock.release()
+        } catch {
+            if caughtError == nil {
+                throw ContentError.lockExpired
+            }
+            // If there was already an error, prioritize that over release failure
+        }
+
+        // Re-throw if there was an error
+        if let error = caughtError {
+            throw error
+        }
+    }
+
+    /// Internal deploy implementation that assumes lock is held.
+    private func deployWithLock() async throws {
+        // Read staging pointer
+        let stagingData: Data
+        do {
+            stagingData = try await storage.read(path: "\(contentsPrefix).staging.json")
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Write to production
+        do {
+            try await storage.write(path: "\(contentsPrefix).production.json", data: stagingData)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Update .ref files for all objects in an edition.
+    /// - Parameters:
+    ///   - edition: Edition ID
+    ///   - lock: Lock handle for renewal during long operations
+    private func updateRefFiles(forEdition edition: Int, lock: LockHandle) async throws {
+        let editionPrefix = "\(editionsPrefix)\(edition)/"
+
+        // List all path files in the edition
+        let keys: [String]
+        do {
+            keys = try await storage.list(prefix: editionPrefix, delimiter: nil)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var processedCount = 0
+        let renewInterval = 20  // Renew lock every 20 objects
+
+        for key in keys {
+            // Skip directories (they have trailing slash)
+            if key.hasSuffix("/") { continue }
+
+            // Skip metadata files
+            let filename = key.replacingOccurrences(of: editionPrefix, with: "")
+            if filename.hasPrefix(".") { continue }
+
+            // Read path file to get hash
+            do {
+                let content = try await storage.read(path: key)
+                guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    continue
+                }
+
+                // Skip tombstones
+                if text == "deleted" { continue }
+
+                // Extract hash from "sha256:{hash}"
+                guard text.hasPrefix("sha256:") else { continue }
+                let hash = String(text.dropFirst(7))
+
+                // Update .ref file
+                try await appendToRefFile(hash: hash, edition: edition)
+
+                processedCount += 1
+                if processedCount % renewInterval == 0 {
+                    // Renew lock periodically
+                    do {
+                        try await lock.renew(duration: 60)
+                    } catch {
+                        throw ContentError.lockExpired
+                    }
+                }
+            } catch StorageError.notFound {
+                continue
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+        }
+    }
+
+    /// Append edition ID to an object's .ref file.
+    private func appendToRefFile(hash: String, edition: Int) async throws {
+        let shard = String(hash.prefix(2))
+        let refPath = "\(objectsPrefix)\(shard)/\(hash).ref"
+
+        // Read existing .ref file (if any)
+        var editions: Set<Int> = []
+        do {
+            let data = try await storage.read(path: refPath)
+            if let content = String(data: data, encoding: .utf8) {
+                for line in content.split(separator: "\n") {
+                    if let id = Int(line.trimmingCharacters(in: .whitespaces)) {
+                        editions.insert(id)
+                    }
+                }
+            }
+        } catch StorageError.notFound {
+            // No existing .ref file
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Add new edition
+        editions.insert(edition)
+
+        // Write updated .ref file
+        let content = editions.sorted().map { String($0) }.joined(separator: "\n")
+        do {
+            try await storage.write(path: refPath, data: content.data(using: .utf8)!)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
     // MARK: - Private Helpers
 
     /// Write object to content-addressable storage.
