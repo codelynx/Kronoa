@@ -16,12 +16,23 @@ file:./local.md           # Local path (explicit)
 
 Session state is stored in `.kronoa/session` (persistent across terminals).
 
-### Environment Variables
+### Storage Configuration
+
+Storage can be configured via environment variable or config command:
 
 ```bash
-KRONOA_STORAGE=s3://bucket/prefix    # Storage backend
-KRONOA_STORAGE=file:///path/to/local # Local filesystem
+# Environment variable
+KRONOA_STORAGE=s3://bucket/prefix    # S3 backend
+KRONOA_STORAGE=file:///path/to/local # Local filesystem (explicit)
+
+# Config command (accepts multiple formats)
+kronoa config set storage s3://bucket/prefix   # S3
+kronoa config set storage file:///path         # Local (explicit)
+kronoa config set storage ./local-storage      # Local (bare path, normalized to file://)
+kronoa config set storage ~/kronoa-data        # Local with tilde expansion
 ```
+
+Bare paths are automatically normalized to `file://` URLs when saved.
 
 ### Config Commands
 
@@ -135,6 +146,14 @@ kronoa rollback               # Discard all buffered changes
 kronoa submit "Added new articles"    # Submit for review
 ```
 
+After submitting, the session enters "submitted" mode. Most commands will reject further operations until you clear the session:
+
+```bash
+kronoa ls                             # Error: Edition has been submitted
+kronoa done                           # Clear session
+kronoa pending                        # Check submission status
+```
+
 ## Admin Workflow
 
 ### Review Pending
@@ -164,14 +183,16 @@ kronoa rejected 10001                 # Get specific rejection
 kronoa deploy                         # Promote staging to production
 ```
 
-### Rollback
+### Admin Rollback
 
 ```bash
-kronoa rollback 10003                 # Set staging pointer + deploy (single command)
-kronoa rollback 10003 --no-deploy     # Set staging pointer only, skip deploy
+kronoa admin-rollback 10003                 # Set staging pointer + deploy (single command)
+kronoa admin-rollback 10003 --no-deploy     # Set staging pointer only, skip deploy
 ```
 
-**Note:** `kronoa rollback` performs both `setStagingPointer` and `deploy` in one command for emergency scenarios. Use `--no-deploy` to only update staging without promoting to production.
+**Note:** `kronoa admin-rollback` performs both `setStagingPointer` and `deploy` in one command for emergency scenarios. Use `--no-deploy` to only update staging without promoting to production.
+
+**Important:** This is distinct from `kronoa rollback` (editor command) which discards buffered transaction changes.
 
 ## Maintenance
 
