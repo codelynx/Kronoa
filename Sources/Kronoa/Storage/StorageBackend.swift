@@ -13,6 +13,11 @@ public protocol StorageBackend: Sendable {
     /// Overwrites if file exists.
     func write(path: String, data: Data) async throws
 
+    /// Write file only if it doesn't exist (atomic create-if-absent).
+    /// - Returns: true if file was created, false if it already existed
+    /// - Throws: `StorageError` on I/O failure
+    func writeIfAbsent(path: String, data: Data) async throws -> Bool
+
     /// Delete file.
     /// - Throws: `StorageError.notFound` if file doesn't exist
     func delete(path: String) async throws
