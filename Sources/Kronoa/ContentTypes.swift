@@ -71,3 +71,22 @@ public struct EditionPointer: Codable, Equatable, Sendable {
         self.edition = edition
     }
 }
+
+/// A buffered change in a transaction.
+public struct PendingChange: Equatable, Sendable {
+    public let path: String
+    public let action: ChangeAction
+
+    public init(path: String, action: ChangeAction) {
+        self.path = path
+        self.action = action
+    }
+}
+
+/// Type of change action.
+public enum ChangeAction: Equatable, Sendable {
+    /// Write new content (hash computed, data buffered)
+    case write(hash: String, size: Int)
+    /// Delete (tombstone)
+    case delete
+}

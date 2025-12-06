@@ -595,4 +595,608 @@ struct ContentSessionTests {
         let data = try await storage.read(path: "test/existing.txt")
         #expect(String(data: data, encoding: .utf8) == "original")
     }
+
+    // MARK: - Write Tests
+
+    @Test("Write creates object and path file")
+    func writeCreatesFiles() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "writer")
+
+        let content = "Hello, World!"
+        try await session.write(path: "greeting.txt", data: content.data(using: .utf8)!)
+
+        // Verify we can read it back
+        let readData = try await session.read(path: "greeting.txt")
+        #expect(String(data: readData, encoding: .utf8) == content)
+
+        // Verify object exists in storage
+        let stat = try await session.stat(path: "greeting.txt")
+        #expect(stat.status == .exists)
+        #expect(stat.hash != nil)
+    }
+
+    @Test("Write rejects in read-only mode")
+    func writeRejectsReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        await #expect(throws: ContentError.readOnlyMode) {
+            try await session.write(path: "file.txt", data: "data".data(using: .utf8)!)
+        }
+    }
+
+    @Test("Write deduplicates identical content")
+    func writeDeduplicates() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "dedup")
+
+        let content = "Same content"
+        try await session.write(path: "file1.txt", data: content.data(using: .utf8)!)
+        try await session.write(path: "file2.txt", data: content.data(using: .utf8)!)
+
+        // Both files should have same hash
+        let stat1 = try await session.stat(path: "file1.txt")
+        let stat2 = try await session.stat(path: "file2.txt")
+        #expect(stat1.hash == stat2.hash)
+    }
+
+    // MARK: - Delete Tests
+
+    @Test("Delete creates tombstone")
+    func deleteTombstone() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in the base edition
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "original".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/file.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "deleter")
+
+        // Verify file exists before delete
+        #expect(try await session.exists(path: "file.txt") == true)
+
+        // Delete it
+        try await session.delete(path: "file.txt")
+
+        // Verify file no longer exists
+        #expect(try await session.exists(path: "file.txt") == false)
+
+        // Verify tombstone was created
+        let stat = try await session.stat(path: "file.txt")
+        #expect(stat.status == .deleted)
+    }
+
+    @Test("Delete rejects in read-only mode")
+    func deleteRejectsReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        await #expect(throws: ContentError.readOnlyMode) {
+            try await session.delete(path: "file.txt")
+        }
+    }
+
+    // MARK: - Copy Tests
+
+    @Test("Copy creates reference to same hash")
+    func copyCreatesReference() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "copier")
+
+        // Write original file
+        let content = "Original content"
+        try await session.write(path: "original.txt", data: content.data(using: .utf8)!)
+
+        // Copy it
+        try await session.copy(from: "original.txt", to: "copy.txt")
+
+        // Both should have same content and hash
+        let original = try await session.read(path: "original.txt")
+        let copy = try await session.read(path: "copy.txt")
+        #expect(original == copy)
+
+        let stat1 = try await session.stat(path: "original.txt")
+        let stat2 = try await session.stat(path: "copy.txt")
+        #expect(stat1.hash == stat2.hash)
+    }
+
+    @Test("Copy from non-existent file throws notFound")
+    func copyNotFound() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "copier")
+
+        await #expect(throws: ContentError.notFound(path: "missing.txt")) {
+            try await session.copy(from: "missing.txt", to: "dest.txt")
+        }
+    }
+
+    // MARK: - Discard Tests
+
+    @Test("Discard removes local change")
+    func discardRemovesChange() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in the base edition
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "original".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/file.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "discarder")
+
+        // Modify the file
+        try await session.write(path: "file.txt", data: "modified".data(using: .utf8)!)
+
+        // Verify modification
+        let modified = try await session.read(path: "file.txt")
+        #expect(String(data: modified, encoding: .utf8) == "modified")
+
+        // Discard change
+        try await session.discard(path: "file.txt")
+
+        // Should see original content through ancestry
+        let restored = try await session.read(path: "file.txt")
+        #expect(String(data: restored, encoding: .utf8) == "original")
+    }
+
+    // MARK: - Transaction Tests
+
+    @Test("beginEditing starts transaction")
+    func beginEditingStartsTransaction() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+
+        #expect(await session.isInTransaction == false)
+        try await session.beginEditing()
+        #expect(await session.isInTransaction == true)
+    }
+
+    @Test("beginEditing rejects in read-only mode")
+    func beginEditingRejectsReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        await #expect(throws: ContentError.readOnlyMode) {
+            try await session.beginEditing()
+        }
+    }
+
+    @Test("beginEditing rejects if already in transaction")
+    func beginEditingRejectsNested() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+
+        try await session.beginEditing()
+
+        await #expect(throws: ContentError.alreadyInTransaction) {
+            try await session.beginEditing()
+        }
+    }
+
+    @Test("Transaction buffers changes until endEditing")
+    func transactionBuffersChanges() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+        let editionId = await session.editionId
+
+        try await session.beginEditing()
+
+        // Write in transaction
+        try await session.write(path: "a.txt", data: "A".data(using: .utf8)!)
+        try await session.write(path: "b.txt", data: "B".data(using: .utf8)!)
+
+        // Check pending changes
+        let pending = await session.pendingChanges
+        #expect(pending.count == 2)
+
+        // Path files should NOT exist yet
+        let pathFileA = "contents/editions/\(editionId)/a.txt"
+        let existsA = try await storage.exists(path: pathFileA)
+        #expect(existsA == false)
+
+        // End transaction
+        try await session.endEditing()
+
+        // Now path files should exist
+        let existsAfter = try await storage.exists(path: pathFileA)
+        #expect(existsAfter == true)
+
+        #expect(await session.isInTransaction == false)
+        #expect(await session.pendingChanges.isEmpty)
+    }
+
+    @Test("rollback discards buffered changes")
+    func rollbackDiscardsChanges() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+
+        try await session.beginEditing()
+        try await session.write(path: "temp.txt", data: "temporary".data(using: .utf8)!)
+
+        #expect(await session.pendingChanges.count == 1)
+
+        try await session.rollback()
+
+        #expect(await session.isInTransaction == false)
+        #expect(await session.pendingChanges.isEmpty)
+
+        // File should not exist
+        #expect(try await session.exists(path: "temp.txt") == false)
+    }
+
+    @Test("rollback throws if not in transaction")
+    func rollbackThrowsIfNotInTransaction() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+
+        await #expect(throws: ContentError.notInTransaction) {
+            try await session.rollback()
+        }
+    }
+
+    @Test("endEditing throws if not in transaction")
+    func endEditingThrowsIfNotInTransaction() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "transactor")
+
+        await #expect(throws: ContentError.notInTransaction) {
+            try await session.endEditing()
+        }
+    }
+
+    // MARK: - Transaction Visibility Tests
+
+    @Test("Read sees buffered write in transaction")
+    func readSeesBufferedWrite() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "reader")
+
+        try await session.beginEditing()
+
+        // Write in transaction
+        let content = "Buffered content"
+        try await session.write(path: "new.txt", data: content.data(using: .utf8)!)
+
+        // Read should see the buffered content (not notFound)
+        let readData = try await session.read(path: "new.txt")
+        #expect(String(data: readData, encoding: .utf8) == content)
+
+        try await session.rollback()
+    }
+
+    @Test("Exists sees buffered write in transaction")
+    func existsSeesBufferedWrite() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "checker")
+
+        try await session.beginEditing()
+
+        // Write in transaction
+        try await session.write(path: "new.txt", data: "content".data(using: .utf8)!)
+
+        // Exists should return true
+        #expect(try await session.exists(path: "new.txt") == true)
+
+        try await session.rollback()
+    }
+
+    @Test("Stat sees buffered write in transaction")
+    func statSeesBufferedWrite() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "statter")
+
+        try await session.beginEditing()
+
+        let content = "content data"
+        try await session.write(path: "new.txt", data: content.data(using: .utf8)!)
+
+        let stat = try await session.stat(path: "new.txt")
+        #expect(stat.status == .exists)
+        #expect(stat.size == content.count)
+
+        try await session.rollback()
+    }
+
+    @Test("Read sees buffered delete in transaction")
+    func readSeesBufferedDelete() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in base edition
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "original".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/existing.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "deleter")
+
+        // File exists before transaction
+        #expect(try await session.exists(path: "existing.txt") == true)
+
+        try await session.beginEditing()
+
+        // Delete in transaction
+        try await session.delete(path: "existing.txt")
+
+        // Read should throw notFound
+        await #expect(throws: ContentError.notFound(path: "existing.txt")) {
+            _ = try await session.read(path: "existing.txt")
+        }
+
+        // Exists should return false
+        #expect(try await session.exists(path: "existing.txt") == false)
+
+        try await session.rollback()
+    }
+
+    @Test("Copy sees buffered write in transaction")
+    func copySeesBufferedWrite() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "copier")
+
+        try await session.beginEditing()
+
+        // Write in transaction
+        let content = "source content"
+        try await session.write(path: "source.txt", data: content.data(using: .utf8)!)
+
+        // Copy the buffered file
+        try await session.copy(from: "source.txt", to: "dest.txt")
+
+        // Both should be readable
+        let sourceData = try await session.read(path: "source.txt")
+        let destData = try await session.read(path: "dest.txt")
+        #expect(sourceData == destData)
+
+        try await session.rollback()
+    }
+
+    @Test("Copy fails for buffered delete in transaction")
+    func copyFailsForBufferedDelete() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in base edition
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "original".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/existing.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "copier")
+
+        try await session.beginEditing()
+
+        // Delete in transaction
+        try await session.delete(path: "existing.txt")
+
+        // Copy should fail with notFound
+        await #expect(throws: ContentError.notFound(path: "existing.txt")) {
+            try await session.copy(from: "existing.txt", to: "dest.txt")
+        }
+
+        try await session.rollback()
+    }
+
+    @Test("List sees buffered writes in transaction")
+    func listSeesBufferedWrites() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "lister")
+
+        try await session.beginEditing()
+
+        // Write files in transaction
+        try await session.write(path: "a.txt", data: "A".data(using: .utf8)!)
+        try await session.write(path: "b.txt", data: "B".data(using: .utf8)!)
+
+        // List should see them
+        let entries = try await session.list(directory: "")
+        #expect(entries.contains("a.txt"))
+        #expect(entries.contains("b.txt"))
+
+        try await session.rollback()
+    }
+
+    @Test("List hides buffered deletes in transaction")
+    func listHidesBufferedDeletes() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in base edition
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "original".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/existing.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "lister")
+
+        // File visible before transaction
+        let beforeList = try await session.list(directory: "")
+        #expect(beforeList.contains("existing.txt"))
+
+        try await session.beginEditing()
+
+        // Delete in transaction
+        try await session.delete(path: "existing.txt")
+
+        // List should not show deleted file
+        let afterList = try await session.list(directory: "")
+        #expect(!afterList.contains("existing.txt"))
+
+        try await session.rollback()
+    }
+
+    @Test("Read and stat return consistent results when buffered write shadows ancestor")
+    func readStatConsistentWithShadowing() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file with DIFFERENT content in the ancestor edition
+        let ancestorHash = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1"
+        try await storage.write(
+            path: "contents/objects/ab/\(ancestorHash).dat",
+            data: "ancestor content".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/shadowed.txt",
+            data: "sha256:\(ancestorHash)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "shadower")
+
+        // Verify ancestor content is accessible
+        let ancestorRead = try await session.read(path: "shadowed.txt")
+        #expect(String(data: ancestorRead, encoding: .utf8) == "ancestor content")
+
+        try await session.beginEditing()
+
+        // Write DIFFERENT content in the transaction (shadows ancestor)
+        let newContent = "new buffered content"
+        try await session.write(path: "shadowed.txt", data: newContent.data(using: .utf8)!)
+
+        // Both stat and read should see the buffered version, NOT the ancestor
+        let stat = try await session.stat(path: "shadowed.txt")
+        let readData = try await session.read(path: "shadowed.txt")
+
+        #expect(stat.status == .exists)
+        #expect(stat.size == newContent.count)  // Size of buffered content
+        #expect(String(data: readData, encoding: .utf8) == newContent)  // Buffered content, not ancestor
+
+        // Verify hash from stat matches the new content, not the ancestor
+        #expect(stat.hash != ancestorHash)
+
+        try await session.rollback()
+    }
+
+    @Test("List does not show subdirectory when all pending changes are deletes")
+    func listHidesSubdirWithOnlyDeletes() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create files in a subdirectory in the ancestor
+        let hash1 = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1"
+        let hash2 = "def456def456def456def456def456def456def456def456def456def456def4"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash1).dat",
+            data: "file1".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/objects/de/\(hash2).dat",
+            data: "file2".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/subdir/file1.txt",
+            data: "sha256:\(hash1)".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/subdir/file2.txt",
+            data: "sha256:\(hash2)".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "deleter")
+
+        // Subdir should be visible initially
+        let beforeList = try await session.list(directory: "")
+        #expect(beforeList.contains("subdir/"))
+
+        try await session.beginEditing()
+
+        // Delete both files in the subdirectory
+        try await session.delete(path: "subdir/file1.txt")
+        try await session.delete(path: "subdir/file2.txt")
+
+        // The subdir should NOT appear in list when all pending changes under it are deletes
+        // Semantics: transaction reads see state as-if changes were committed
+        let afterList = try await session.list(directory: "")
+        #expect(!afterList.contains("subdir/"))
+
+        try await session.rollback()
+    }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Content session for reading and writing versioned content.
 ///
@@ -13,6 +14,10 @@ public actor ContentSession {
     private var _editionId: Int
     private var _baseEditionId: Int?
     private var _checkoutSource: CheckoutSource?
+
+    // Transaction state
+    private var _isInTransaction: Bool = false
+    private var _pendingChanges: [String: BufferedChange] = [:]  // path -> change
 
     // Storage paths
     private nonisolated let contentsPrefix = "contents/"
@@ -37,6 +42,20 @@ public actor ContentSession {
     /// Checkout source (only set in editing mode).
     public nonisolated var checkoutSource: CheckoutSource? {
         get async { await _checkoutSource }
+    }
+
+    /// Whether currently in a transaction.
+    public nonisolated var isInTransaction: Bool {
+        get async { await _isInTransaction }
+    }
+
+    /// Get list of buffered changes (for preview before commit).
+    public nonisolated var pendingChanges: [PendingChange] {
+        get async {
+            await _pendingChanges.map { path, change in
+                PendingChange(path: path, action: change.action)
+            }.sorted { $0.path < $1.path }
+        }
     }
 
     /// Create a new content session.
@@ -184,6 +203,7 @@ public actor ContentSession {
     // MARK: - Read Operations
 
     /// Read file content, resolving through ancestry chain.
+    /// In a transaction, sees buffered changes.
     ///
     /// - Parameter path: Content path (e.g., "articles/hello.md")
     /// - Returns: File content
@@ -191,10 +211,25 @@ public actor ContentSession {
     public func read(path: String) async throws -> Data {
         try validateContentPath(path)
 
-        let stat = try await statInternal(path: path)
-        switch stat.status {
+        // Check pending changes first (transaction-aware)
+        if let pending = _pendingChanges[path] {
+            switch pending.action {
+            case .write(let hash, _):
+                // Return buffered data if available, otherwise read from storage
+                if let data = pending.data {
+                    return data
+                }
+                return try await readObject(hash: hash)
+            case .delete:
+                throw ContentError.notFound(path: path)
+            }
+        }
+
+        // Use statInternal for consistency with stat() (both see pending changes)
+        let fileStat = try await statInternal(path: path)
+        switch fileStat.status {
         case .exists:
-            guard let hash = stat.hash else {
+            guard let hash = fileStat.hash else {
                 throw ContentError.notFound(path: path)
             }
             return try await readObject(hash: hash)
@@ -204,6 +239,7 @@ public actor ContentSession {
     }
 
     /// Check if file exists (false for tombstoned files).
+    /// In a transaction, sees buffered changes.
     ///
     /// - Parameter path: Content path
     /// - Returns: true if file exists and is not tombstoned
@@ -215,6 +251,7 @@ public actor ContentSession {
     }
 
     /// Get file metadata without fetching content.
+    /// In a transaction, sees buffered changes.
     ///
     /// - Parameter path: Content path
     /// - Returns: File metadata including status
@@ -224,8 +261,22 @@ public actor ContentSession {
         return try await statInternal(path: path)
     }
 
-    /// Internal stat implementation without path validation.
+    /// Internal stat implementation (transaction-aware).
     private func statInternal(path: String) async throws -> FileStat {
+        // Check pending changes first
+        if let pending = _pendingChanges[path] {
+            switch pending.action {
+            case .write(let hash, let size):
+                return FileStat(path: path, status: .exists, resolvedFrom: _editionId, hash: hash, size: size)
+            case .delete:
+                return FileStat(path: path, status: .deleted, resolvedFrom: _editionId)
+            }
+        }
+        return try await statFromStorage(path: path)
+    }
+
+    /// Stat from storage only (ignores pending changes).
+    private func statFromStorage(path: String) async throws -> FileStat {
         var currentEdition = _editionId
 
         while true {
@@ -345,6 +396,7 @@ public actor ContentSession {
     // MARK: - List
 
     /// List immediate children of a directory.
+    /// In a transaction, sees buffered changes.
     ///
     /// Results are merged from ancestry, tombstones excluded.
     /// Returns entries in lexicographic order.
@@ -357,7 +409,7 @@ public actor ContentSession {
         return entries.sorted()
     }
 
-    /// Internal list implementation.
+    /// Internal list implementation (transaction-aware).
     private func listInternal(directory: String) async throws -> Set<String> {
         // Validate directory path (allow empty for root)
         if !directory.isEmpty {
@@ -368,6 +420,61 @@ public actor ContentSession {
 
         // Normalize directory path
         let normalizedDir = directory.isEmpty ? "" : (directory.hasSuffix("/") ? directory : directory + "/")
+
+        // First, collect pending changes that affect this directory
+        // Track subdirs with their write/delete counts to determine visibility
+        var pendingEntries: [String: Bool] = [:]  // name -> isDeleted
+        var subdirWrites: [String: Int] = [:]     // subdir -> count of non-delete changes
+        var subdirDeletes: [String: Int] = [:]    // subdir -> count of delete changes
+
+        for (path, change) in _pendingChanges {
+            let isDeleted = change.action == .delete
+
+            // Check if this path is in the target directory
+            if normalizedDir.isEmpty {
+                // Root directory: only include paths without /
+                if !path.contains("/") {
+                    pendingEntries[path] = isDeleted
+                } else {
+                    // It's in a subdirectory - track writes vs deletes
+                    let subdir = String(path.split(separator: "/").first!) + "/"
+                    if isDeleted {
+                        subdirDeletes[subdir, default: 0] += 1
+                    } else {
+                        subdirWrites[subdir, default: 0] += 1
+                    }
+                }
+            } else if path.hasPrefix(normalizedDir) {
+                let remainder = String(path.dropFirst(normalizedDir.count))
+                if !remainder.contains("/") {
+                    // Direct child file
+                    pendingEntries[remainder] = isDeleted
+                } else {
+                    // Nested - track writes vs deletes for subdirectory
+                    let subdir = String(remainder.split(separator: "/").first!) + "/"
+                    if isDeleted {
+                        subdirDeletes[subdir, default: 0] += 1
+                    } else {
+                        subdirWrites[subdir, default: 0] += 1
+                    }
+                }
+            }
+        }
+
+        // Determine subdir visibility based on pending changes
+        // A subdir with any writes is visible; a subdir with only deletes should be hidden
+        let allSubdirs = Set(subdirWrites.keys).union(subdirDeletes.keys)
+        for subdir in allSubdirs {
+            let writes = subdirWrites[subdir, default: 0]
+            let deletes = subdirDeletes[subdir, default: 0]
+            if writes > 0 {
+                // Has at least one write - subdir should be visible
+                pendingEntries[subdir] = false
+            } else if deletes > 0 {
+                // Only deletes - mark subdir as deleted to suppress it from storage results
+                pendingEntries[subdir] = true
+            }
+        }
 
         var allEntries: [String: EntryInfo] = [:]  // name -> (edition, isDeleted)
         var currentEdition = _editionId
@@ -423,8 +530,248 @@ public actor ContentSession {
             currentEdition = parent
         }
 
+        // Merge pending entries (they take precedence)
+        for (name, isDeleted) in pendingEntries {
+            allEntries[name] = EntryInfo(edition: _editionId, isDeleted: isDeleted)
+        }
+
         // Filter out deleted entries
         return Set(allEntries.filter { !$0.value.isDeleted }.keys)
+    }
+
+    // MARK: - Transactional Editing
+
+    /// Begin a transaction (changes buffered in memory).
+    /// - Throws: `ContentError.alreadyInTransaction`, `ContentError.readOnlyMode`
+    public func beginEditing() async throws {
+        guard case .editing = _mode else {
+            throw ContentError.readOnlyMode
+        }
+        guard !_isInTransaction else {
+            throw ContentError.alreadyInTransaction
+        }
+        _isInTransaction = true
+    }
+
+    /// Flush buffered changes to storage.
+    /// Writes objects and path files. Does NOT update .ref files (that happens in stage()).
+    /// - Throws: `ContentError.notInTransaction`, `ContentError.storageError`
+    public func endEditing() async throws {
+        guard _isInTransaction else {
+            throw ContentError.notInTransaction
+        }
+
+        // Write all buffered changes
+        for (path, change) in _pendingChanges {
+            switch change.action {
+            case .write(let hash, _):
+                // Write object if we have data buffered
+                if let data = change.data {
+                    try await writeObject(hash: hash, data: data)
+                }
+                // Write path file
+                let pathFile = "\(editionsPrefix)\(_editionId)/\(path)"
+                do {
+                    try await storage.write(path: pathFile, data: "sha256:\(hash)".data(using: .utf8)!)
+                } catch let error as StorageError {
+                    throw ContentError.storageError(underlying: error)
+                }
+
+            case .delete:
+                // Write tombstone
+                let pathFile = "\(editionsPrefix)\(_editionId)/\(path)"
+                do {
+                    try await storage.write(path: pathFile, data: "deleted".data(using: .utf8)!)
+                } catch let error as StorageError {
+                    throw ContentError.storageError(underlying: error)
+                }
+            }
+        }
+
+        // Clear transaction state
+        _pendingChanges.removeAll()
+        _isInTransaction = false
+    }
+
+    /// Discard buffered changes without writing.
+    /// - Throws: `ContentError.notInTransaction`
+    public func rollback() async throws {
+        guard _isInTransaction else {
+            throw ContentError.notInTransaction
+        }
+        _pendingChanges.removeAll()
+        _isInTransaction = false
+    }
+
+    // MARK: - Write Operations
+
+    /// Write file content (editing mode only).
+    /// If in a transaction, buffers the change. Otherwise, auto-commits.
+    /// - Throws: `ContentError.invalidPath`, `ContentError.readOnlyMode`
+    public func write(path: String, data: Data) async throws {
+        try validateContentPath(path)
+
+        guard case .editing = _mode else {
+            throw ContentError.readOnlyMode
+        }
+
+        // Compute hash
+        let hash = computeSHA256(data)
+
+        if _isInTransaction {
+            // Buffer the change
+            _pendingChanges[path] = BufferedChange(
+                action: .write(hash: hash, size: data.count),
+                data: data
+            )
+        } else {
+            // Auto-commit: write object and path file directly
+            try await writeObject(hash: hash, data: data)
+            let pathFile = "\(editionsPrefix)\(_editionId)/\(path)"
+            do {
+                try await storage.write(path: pathFile, data: "sha256:\(hash)".data(using: .utf8)!)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+        }
+    }
+
+    /// Delete file - creates tombstone (editing mode only).
+    /// If in a transaction, buffers the change. Otherwise, auto-commits.
+    /// - Throws: `ContentError.invalidPath`, `ContentError.readOnlyMode`
+    public func delete(path: String) async throws {
+        try validateContentPath(path)
+
+        guard case .editing = _mode else {
+            throw ContentError.readOnlyMode
+        }
+
+        if _isInTransaction {
+            // Buffer the deletion
+            _pendingChanges[path] = BufferedChange(action: .delete, data: nil)
+        } else {
+            // Auto-commit: write tombstone directly
+            let pathFile = "\(editionsPrefix)\(_editionId)/\(path)"
+            do {
+                try await storage.write(path: pathFile, data: "deleted".data(using: .utf8)!)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+        }
+    }
+
+    /// Copy file within the edition (no data transfer, just hash reference).
+    /// - Throws: `ContentError.invalidPath`, `ContentError.readOnlyMode`, `ContentError.notFound`
+    public func copy(from sourcePath: String, to destPath: String) async throws {
+        try validateContentPath(sourcePath)
+        try validateContentPath(destPath)
+
+        guard case .editing = _mode else {
+            throw ContentError.readOnlyMode
+        }
+
+        // Check pending changes first for source (transaction-aware)
+        if let pendingSource = _pendingChanges[sourcePath] {
+            switch pendingSource.action {
+            case .write(let hash, let size):
+                if _isInTransaction {
+                    // Copy buffered data reference
+                    _pendingChanges[destPath] = BufferedChange(
+                        action: .write(hash: hash, size: size),
+                        data: pendingSource.data  // Carry forward buffered data if present
+                    )
+                } else {
+                    // Auto-commit: write path file pointing to same hash
+                    let pathFile = "\(editionsPrefix)\(_editionId)/\(destPath)"
+                    do {
+                        try await storage.write(path: pathFile, data: "sha256:\(hash)".data(using: .utf8)!)
+                    } catch let error as StorageError {
+                        throw ContentError.storageError(underlying: error)
+                    }
+                }
+                return
+            case .delete:
+                throw ContentError.notFound(path: sourcePath)
+            }
+        }
+
+        // Get source file's hash from storage
+        let stat = try await statFromStorage(path: sourcePath)
+        guard stat.status == .exists, let hash = stat.hash, let size = stat.size else {
+            throw ContentError.notFound(path: sourcePath)
+        }
+
+        if _isInTransaction {
+            // Buffer the copy (no data needed, object already in storage)
+            _pendingChanges[destPath] = BufferedChange(
+                action: .write(hash: hash, size: size),
+                data: nil
+            )
+        } else {
+            // Auto-commit: write path file pointing to same hash
+            let pathFile = "\(editionsPrefix)\(_editionId)/\(destPath)"
+            do {
+                try await storage.write(path: pathFile, data: "sha256:\(hash)".data(using: .utf8)!)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+        }
+    }
+
+    /// Discard local change to a path (editing mode only).
+    /// Removes the path from this edition, so it resolves through ancestry.
+    /// - Throws: `ContentError.invalidPath`, `ContentError.readOnlyMode`
+    public func discard(path: String) async throws {
+        try validateContentPath(path)
+
+        guard case .editing = _mode else {
+            throw ContentError.readOnlyMode
+        }
+
+        if _isInTransaction {
+            // Remove from pending changes
+            _pendingChanges.removeValue(forKey: path)
+        }
+
+        // Also remove from storage if already written
+        let pathFile = "\(editionsPrefix)\(_editionId)/\(path)"
+        do {
+            try await storage.delete(path: pathFile)
+        } catch StorageError.notFound {
+            // Already gone, that's fine
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    /// Write object to content-addressable storage.
+    private func writeObject(hash: String, data: Data) async throws {
+        let shard = String(hash.prefix(2))
+        let objectPath = "\(objectsPrefix)\(shard)/\(hash).dat"
+
+        // Check if object already exists (deduplication)
+        do {
+            if try await storage.exists(path: objectPath) {
+                return  // Already stored
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // Write new object
+        do {
+            try await storage.write(path: objectPath, data: data)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+    }
+
+    /// Compute SHA256 hash of data.
+    private func computeSHA256(_ data: Data) -> String {
+        let hash = SHA256.hash(data: data)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -432,4 +779,10 @@ public actor ContentSession {
 private struct EntryInfo {
     let edition: Int
     let isDeleted: Bool
+}
+
+/// Buffered change in a transaction.
+private struct BufferedChange {
+    let action: ChangeAction
+    let data: Data?  // Only present for writes with new data
 }
