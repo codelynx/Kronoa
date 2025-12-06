@@ -58,18 +58,66 @@ Production ◄─── deploy ◄─── Staging ◄─── stage ◄──
 4. **Stage** - accept into staging (validates base matches current pointer)
 5. **Deploy** - publish staging to production
 
+## CLI
+
+Kronoa includes a command-line interface for content management:
+
+```bash
+# Build and install
+swift build -c release
+cp .build/release/kronoa /usr/local/bin/
+
+# Configure storage
+kronoa config set storage s3://my-bucket/content
+# or for local development:
+kronoa config set storage ./local-storage
+
+# Check status
+kronoa status
+
+# Start editing
+kronoa checkout my-feature
+
+# Make changes
+echo "# Hello World" | kronoa write kr:articles/hello.md
+kronoa ls kr:articles/
+kronoa cat kr:articles/hello.md
+
+# Submit for review
+kronoa submit "Add hello world article"
+
+# Admin: review and deploy
+kronoa pending
+kronoa stage 10001
+kronoa deploy
+
+# Clear session
+kronoa done
+```
+
+### CLI Commands
+
+| Category | Commands |
+|----------|----------|
+| Session | `status`, `done`, `config` |
+| Navigation | `pwd`, `cd` |
+| File Ops | `ls`, `cat`, `write`, `cp`, `rm`, `stat` |
+| Editor | `checkout`, `begin`, `commit`, `rollback`, `discard`, `submit` |
+| Admin | `pending`, `stage`, `reject`, `rejected`, `deploy`, `admin-rollback` |
+| Maintenance | `flatten`, `gc` |
+
+See [CLI User Guide](docs/cli-guide.md) for details.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) - system design, storage layout, GC algorithm
 - [API Design](docs/api-design.md) - Swift API signatures and data types
 - [Programming Guide](docs/programming-guide.md) - practical guide for app developers
+- [CLI Design](docs/cli-design.md) - CLI reference
+- [CLI User Guide](docs/cli-guide.md) - user-focused CLI guide
 - [Scenario Walkthrough](docs/scenario-walkthrough.md) - step-by-step workflow examples
 - [Rollback Scenarios](docs/scenario-rollback.md) - emergency recovery workflows
 
-## Status
-
-**Design phase** - architecture and API documented, implementation in progress.
-
 ## License
 
-[TBD]
+MIT License - see [LICENSE](LICENSE) for details.
