@@ -13,9 +13,14 @@ let package = Package(
             name: "Kronoa",
             targets: ["Kronoa"]
         ),
+        .executable(
+            name: "kronoa",
+            targets: ["KronoaCLI"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
     ],
     targets: [
         .target(
@@ -24,9 +29,23 @@ let package = Package(
                 .product(name: "AWSS3", package: "aws-sdk-swift"),
             ]
         ),
+        .executableTarget(
+            name: "KronoaCLI",
+            dependencies: [
+                "Kronoa",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
         .testTarget(
             name: "KronoaTests",
             dependencies: ["Kronoa"]
+        ),
+        .testTarget(
+            name: "CLITests",
+            dependencies: [
+                "KronoaCLI",
+                "Kronoa",
+            ]
         ),
     ]
 )

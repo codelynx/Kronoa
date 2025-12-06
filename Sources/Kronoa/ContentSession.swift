@@ -62,25 +62,47 @@ public actor ContentSession {
     ///
     /// - Parameters:
     ///   - storage: Storage backend to use
-    ///   - mode: Initial session mode (.production or .staging)
-    /// - Throws: `ContentError.storageError` if edition pointer cannot be read
+    ///   - mode: Session mode (.production, .staging, or .editing(label:) to resume)
+    /// - Throws: `ContentError.storageError` if edition pointer cannot be read,
+    ///           `ContentError.notFound` if editing session doesn't exist
     public init(storage: StorageBackend, mode: SessionMode) async throws {
-        guard case .production = mode, true else {
-            guard case .staging = mode else {
-                fatalError("Initial mode must be .production or .staging")
-            }
-            self.storage = storage
+        self.storage = storage
+
+        switch mode {
+        case .production:
+            self._mode = mode
+            self._editionId = try await Self.readEditionPointer(storage: storage, file: "contents/.production.json")
+            self._baseEditionId = nil
+            self._checkoutSource = nil
+
+        case .staging:
             self._mode = mode
             self._editionId = try await Self.readEditionPointer(storage: storage, file: "contents/.staging.json")
             self._baseEditionId = nil
             self._checkoutSource = nil
-            return
+
+        case .editing(let label):
+            // Resume existing editing session from .{label}.json
+            let workingFile = "contents/.\(label).json"
+            let state: SessionState
+            do {
+                let data = try await storage.read(path: workingFile)
+                state = try JSONDecoder().decode(SessionState.self, from: data)
+            } catch StorageError.notFound {
+                throw ContentError.notFound(path: workingFile)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            } catch {
+                throw ContentError.storageError(underlying: .ioError(error.localizedDescription))
+            }
+            self._mode = mode
+            self._editionId = state.edition
+            self._baseEditionId = state.base
+            self._checkoutSource = state.source
+
+        case .submitted:
+            fatalError("Cannot initialize with .submitted mode")
         }
-        self.storage = storage
-        self._mode = mode
-        self._editionId = try await Self.readEditionPointer(storage: storage, file: "contents/.production.json")
-        self._baseEditionId = nil
-        self._checkoutSource = nil
     }
 
     /// Read edition pointer from a JSON file.
