@@ -15,15 +15,13 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Future: Add AWS SDK for S3 support
-        // .package(url: "https://github.com/soto-project/soto.git", from: "6.0.0"),
+        .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.0.0"),
     ],
     targets: [
         .target(
             name: "Kronoa",
             dependencies: [
-                // Future: Add S3 storage backend
-                // .product(name: "SotoS3", package: "soto"),
+                .product(name: "AWSS3", package: "aws-sdk-swift"),
             ]
         ),
         .testTarget(

@@ -27,31 +27,13 @@ public actor LocalFileStorage: StorageBackend {
     /// - Throws: `StorageError.invalidPath` for invalid paths
     /// - Returns: Resolved URL within root
     private func validatePath(_ path: String) throws -> URL {
-        // Check for empty path
-        guard !path.isEmpty else {
-            throw StorageError.invalidPath("Path cannot be empty")
-        }
-
-        // Check for absolute paths
-        guard !path.hasPrefix("/") else {
-            throw StorageError.invalidPath("Absolute paths not allowed: \(path)")
-        }
-
-        // Check for path traversal attempts
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        for component in components {
-            if component == ".." {
-                throw StorageError.invalidPath("Path traversal not allowed: \(path)")
-            }
-            if component == "." {
-                throw StorageError.invalidPath("Current directory reference not allowed: \(path)")
-            }
-        }
+        // Use shared validation
+        try PathValidation.validatePath(path)
 
         // Build the resolved URL
         let resolvedURL = root.appendingPathComponent(path).standardizedFileURL
 
-        // Verify the resolved path is still under root
+        // Verify the resolved path is still under root (symlink escape protection)
         let resolvedPath = resolvedURL.path
         let rootPath = root.path
         guard resolvedPath.hasPrefix(rootPath + "/") || resolvedPath == rootPath else {
@@ -63,24 +45,7 @@ public actor LocalFileStorage: StorageBackend {
 
     /// Validate a prefix path for listing (allows empty and trailing slash).
     private func validatePrefix(_ prefix: String) throws {
-        // Empty prefix is valid (list root)
-        guard !prefix.isEmpty else { return }
-
-        // Check for absolute paths
-        guard !prefix.hasPrefix("/") else {
-            throw StorageError.invalidPath("Absolute paths not allowed: \(prefix)")
-        }
-
-        // Check for path traversal attempts
-        let components = prefix.split(separator: "/", omittingEmptySubsequences: false)
-        for component in components {
-            if component == ".." {
-                throw StorageError.invalidPath("Path traversal not allowed: \(prefix)")
-            }
-            if component == "." {
-                throw StorageError.invalidPath("Current directory reference not allowed: \(prefix)")
-            }
-        }
+        try PathValidation.validatePrefix(prefix)
     }
 
     // MARK: - StorageBackend Implementation

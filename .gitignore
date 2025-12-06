@@ -28,3 +28,6 @@ DerivedData/
 *.swp
 *.swo
 *~
+
+# Credentials
+.credentials/

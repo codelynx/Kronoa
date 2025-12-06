@@ -85,6 +85,10 @@ public enum StorageError: Error, Equatable {
     /// Lock lease expired (another process may have taken it).
     case lockExpired
 
+    /// Concurrent modification detected (ETag mismatch).
+    /// Caller should retry the operation.
+    case concurrentModification(path: String)
+
     /// Generic I/O error with description.
     case ioError(String)
 
