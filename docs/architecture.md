@@ -354,6 +354,31 @@ try admin.deploy()
 
 **Note:** Deploy is a fast operation (single file copy), but can still throw `lockExpired` if S3 operations are slow or clock skew occurs.
 
+### Rollback (Admin Action) - Requires Lock
+
+Rollback reverts staging (and then production via deploy) to a previously-staged edition.
+
+```swift
+try admin.setStagingPointer(to: 10003)  // known good edition
+try admin.deploy()
+```
+
+1. **Acquire lock** on `.lock` (with lease)
+2. Validate edition exists (`editions/10003/` directory)
+3. Update `.staging.json` to `{ "edition": 10003 }`
+4. **Release lock**
+
+**Key differences from `stage()`:**
+- No `.pending/{edition}.json` required
+- No base/source conflict check
+- No `.ref` file updates (edition was already staged before, so `.ref` files exist)
+
+**Use case:** Production has a buggy edition (e.g., 10005). Admin identifies last known good edition (10003), sets staging pointer to 10003, then deploys. See `docs/scenario-rollback.md` for detailed scenarios.
+
+**Validation:** Only checks that `editions/{id}/` directory exists. Does NOT verify the edition was previously staged - this is admin responsibility. Pointing to a never-staged edition would leave its objects without `.ref` entries, making them GC candidates after grace period.
+
+**Safety note:** Only use for editions that were previously staged. Their objects are already tracked in `.ref` files from the original staging operation.
+
 ### Lock Implementation with Lease
 
 Lock file `.lock` contains JSON:
