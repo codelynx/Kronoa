@@ -80,6 +80,42 @@ public actor S3Storage: StorageBackend {
         }
     }
 
+    public func writeIfAbsent(path: String, data: Data) async throws -> Bool {
+        try PathValidation.validatePath(path)
+        let key = fullKey(path)
+        do {
+            // Use if-none-match: * to only create if object doesn't exist
+            let input = PutObjectInput(
+                body: .data(data),
+                bucket: bucket,
+                ifNoneMatch: "*",
+                key: key
+            )
+            _ = try await client.putObject(input: input)
+            return true
+        } catch {
+            // Check for 412 Precondition Failed (object exists)
+            if let httpError = error as? HTTPError,
+               httpError.httpResponse.statusCode == .preconditionFailed {
+                return false
+            }
+            // Also check for ConditionalRequestConflict (409)
+            if let serviceError = error as? ServiceError {
+                if serviceError.typeName == "ConditionalRequestConflict" {
+                    return false
+                }
+            }
+            // Check HTTP status code from any error type
+            if "\(error)".contains("412") || "\(error)".contains("PreconditionFailed") {
+                return false
+            }
+            if "\(error)".contains("409") || "\(error)".contains("ConditionalRequestConflict") {
+                return false
+            }
+            throw StorageError.ioError("S3 writeIfAbsent failed for \(path): \(error)")
+        }
+    }
+
     public func delete(path: String) async throws {
         try PathValidation.validatePath(path)
         let key = fullKey(path)

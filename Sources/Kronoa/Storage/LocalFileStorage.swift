@@ -77,6 +77,44 @@ public actor LocalFileStorage: StorageBackend {
         }
     }
 
+    public func writeIfAbsent(path: String, data: Data) async throws -> Bool {
+        let url = try validatePath(path)
+        let directory = url.deletingLastPathComponent()
+
+        do {
+            // Create parent directories if needed
+            if !fileManager.fileExists(atPath: directory.path) {
+                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+
+            // Use O_CREAT | O_EXCL for atomic create-if-absent
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+            if fd == -1 {
+                if errno == EEXIST {
+                    return false // File already exists
+                }
+                throw StorageError.ioError("Failed to create \(path): \(String(cString: strerror(errno)))")
+            }
+
+            defer { close(fd) }
+
+            // Write data
+            try data.withUnsafeBytes { buffer in
+                guard let baseAddress = buffer.baseAddress else { return }
+                let written = Darwin.write(fd, baseAddress, buffer.count)
+                if written != buffer.count {
+                    throw StorageError.ioError("Failed to write \(path): incomplete write")
+                }
+            }
+
+            return true
+        } catch let error as StorageError {
+            throw error
+        } catch {
+            throw StorageError.ioError("Failed to write \(path): \(error.localizedDescription)")
+        }
+    }
+
     public func delete(path: String) async throws {
         let url = try validatePath(path)
         guard fileManager.fileExists(atPath: url.path) else {
@@ -139,43 +177,65 @@ public actor LocalFileStorage: StorageBackend {
         }
 
         do {
-            let contents = try fileManager.contentsOfDirectory(
-                at: standardizedDirURL,
-                includingPropertiesForKeys: [.isDirectoryKey]
-            )
-
             var results: [String] = []
             let standardizedRootPath = root.path
 
-            for itemURL in contents {
-                // Standardize item URL and build relative path from root
-                let standardizedItemURL = itemURL.standardizedFileURL
-                var relativePath = standardizedItemURL.path
+            if delimiter == "/" {
+                // Hierarchical listing: return immediate children only
+                let contents = try fileManager.contentsOfDirectory(
+                    at: standardizedDirURL,
+                    includingPropertiesForKeys: [.isDirectoryKey]
+                )
 
-                if relativePath.hasPrefix(standardizedRootPath) {
-                    relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
-                    if relativePath.hasPrefix("/") {
-                        relativePath = String(relativePath.dropFirst())
+                for itemURL in contents {
+                    let standardizedItemURL = itemURL.standardizedFileURL
+                    var relativePath = standardizedItemURL.path
+
+                    if relativePath.hasPrefix(standardizedRootPath) {
+                        relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
+                        if relativePath.hasPrefix("/") {
+                            relativePath = String(relativePath.dropFirst())
+                        }
                     }
-                }
 
-                // Apply prefix filter
-                guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
-                    continue
-                }
+                    guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
+                        continue
+                    }
 
-                let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-
-                if delimiter == "/" {
-                    // Hierarchical listing: return immediate children only
+                    let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
                     if isDir {
                         results.append(relativePath + "/")
                     } else {
                         results.append(relativePath)
                     }
-                } else {
-                    // Flat listing
-                    results.append(relativePath)
+                }
+            } else {
+                // Flat listing: recursively list all files
+                let enumerator = fileManager.enumerator(
+                    at: standardizedDirURL,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: []
+                )
+
+                while let itemURL = enumerator?.nextObject() as? URL {
+                    let standardizedItemURL = itemURL.standardizedFileURL
+                    var relativePath = standardizedItemURL.path
+
+                    if relativePath.hasPrefix(standardizedRootPath) {
+                        relativePath = String(relativePath.dropFirst(standardizedRootPath.count))
+                        if relativePath.hasPrefix("/") {
+                            relativePath = String(relativePath.dropFirst())
+                        }
+                    }
+
+                    guard relativePath.hasPrefix(prefix) || prefix.isEmpty else {
+                        continue
+                    }
+
+                    let isDir = (try? standardizedItemURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+                    if !isDir {
+                        results.append(relativePath)
+                    }
                 }
             }
 

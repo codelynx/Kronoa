@@ -149,6 +149,23 @@ try await session.deploy()
 try await session.reject(edition: 10001, reason: "Needs revision")
 ```
 
+### List Rejected Submissions
+
+```swift
+let rejections = try await session.listRejected()
+for r in rejections {
+    print("\(r.edition): \(r.reason)")
+}
+```
+
+### Get Specific Rejection
+
+```swift
+if let rejection = try await session.getRejection(edition: 10001) {
+    print("Rejected: \(rejection.reason)")
+}
+```
+
 ## Rollback
 
 When production has a bad edition:
