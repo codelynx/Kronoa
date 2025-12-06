@@ -21,8 +21,72 @@ public actor LocalFileStorage: StorageBackend {
         self.init(root: URL(fileURLWithPath: rootPath))
     }
 
+    // MARK: - Path Validation
+
+    /// Validate and resolve a path, ensuring it stays within the storage root.
+    /// - Throws: `StorageError.invalidPath` for invalid paths
+    /// - Returns: Resolved URL within root
+    private func validatePath(_ path: String) throws -> URL {
+        // Check for empty path
+        guard !path.isEmpty else {
+            throw StorageError.invalidPath("Path cannot be empty")
+        }
+
+        // Check for absolute paths
+        guard !path.hasPrefix("/") else {
+            throw StorageError.invalidPath("Absolute paths not allowed: \(path)")
+        }
+
+        // Check for path traversal attempts
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        for component in components {
+            if component == ".." {
+                throw StorageError.invalidPath("Path traversal not allowed: \(path)")
+            }
+            if component == "." {
+                throw StorageError.invalidPath("Current directory reference not allowed: \(path)")
+            }
+        }
+
+        // Build the resolved URL
+        let resolvedURL = root.appendingPathComponent(path).standardizedFileURL
+
+        // Verify the resolved path is still under root
+        let resolvedPath = resolvedURL.path
+        let rootPath = root.path
+        guard resolvedPath.hasPrefix(rootPath + "/") || resolvedPath == rootPath else {
+            throw StorageError.invalidPath("Path escapes storage root: \(path)")
+        }
+
+        return resolvedURL
+    }
+
+    /// Validate a prefix path for listing (allows empty and trailing slash).
+    private func validatePrefix(_ prefix: String) throws {
+        // Empty prefix is valid (list root)
+        guard !prefix.isEmpty else { return }
+
+        // Check for absolute paths
+        guard !prefix.hasPrefix("/") else {
+            throw StorageError.invalidPath("Absolute paths not allowed: \(prefix)")
+        }
+
+        // Check for path traversal attempts
+        let components = prefix.split(separator: "/", omittingEmptySubsequences: false)
+        for component in components {
+            if component == ".." {
+                throw StorageError.invalidPath("Path traversal not allowed: \(prefix)")
+            }
+            if component == "." {
+                throw StorageError.invalidPath("Current directory reference not allowed: \(prefix)")
+            }
+        }
+    }
+
+    // MARK: - StorageBackend Implementation
+
     public func read(path: String) async throws -> Data {
-        let url = root.appendingPathComponent(path)
+        let url = try validatePath(path)
         guard fileManager.fileExists(atPath: url.path) else {
             throw StorageError.notFound(path: path)
         }
@@ -34,7 +98,7 @@ public actor LocalFileStorage: StorageBackend {
     }
 
     public func write(path: String, data: Data) async throws {
-        let url = root.appendingPathComponent(path)
+        let url = try validatePath(path)
         let directory = url.deletingLastPathComponent()
 
         do {
@@ -49,7 +113,7 @@ public actor LocalFileStorage: StorageBackend {
     }
 
     public func delete(path: String) async throws {
-        let url = root.appendingPathComponent(path)
+        let url = try validatePath(path)
         guard fileManager.fileExists(atPath: url.path) else {
             throw StorageError.notFound(path: path)
         }
@@ -61,11 +125,14 @@ public actor LocalFileStorage: StorageBackend {
     }
 
     public func exists(path: String) async throws -> Bool {
-        let url = root.appendingPathComponent(path)
+        let url = try validatePath(path)
         return fileManager.fileExists(atPath: url.path)
     }
 
     public func list(prefix: String, delimiter: String?) async throws -> [String] {
+        // Validate prefix
+        try validatePrefix(prefix)
+
         // Determine the directory to list
         let directoryPath: String
 
@@ -89,6 +156,12 @@ public actor LocalFileStorage: StorageBackend {
 
         // Standardize to handle symlinks
         let standardizedDirURL = directoryURL.standardizedFileURL
+
+        // Verify resolved directory is still under root (prevents symlink escape)
+        let rootPath = root.path
+        guard standardizedDirURL.path.hasPrefix(rootPath + "/") || standardizedDirURL.path == rootPath else {
+            throw StorageError.invalidPath("Path escapes storage root: \(prefix)")
+        }
 
         guard fileManager.fileExists(atPath: standardizedDirURL.path) else {
             return [] // Empty result for non-existent directory (S3 semantics)
@@ -148,7 +221,7 @@ public actor LocalFileStorage: StorageBackend {
     }
 
     public func atomicIncrement(path: String, initialValue: Int = 10000) async throws -> Int {
-        let url = root.appendingPathComponent(path)
+        let url = try validatePath(path)
         let directory = url.deletingLastPathComponent()
 
         // Ensure directory exists
@@ -181,7 +254,10 @@ public actor LocalFileStorage: StorageBackend {
         timeout: TimeInterval,
         leaseDuration: TimeInterval
     ) async throws -> LockHandle {
-        try await LocalFileLock(
+        // Validate lock path
+        _ = try validatePath(path)
+
+        return try await LocalFileLock(
             storage: self,
             path: path,
             timeout: timeout,
@@ -304,14 +380,20 @@ public actor LocalFileLock: LockHandle {
             throw StorageError.lockExpired
         }
 
-        guard current.expiresAt > Date() else {
+        let now = Date()
+        guard current.expiresAt > now else {
             throw StorageError.lockExpired
         }
+
+        // Extend from the later of now or current expiry to ensure monotonic extension.
+        // This prevents accidentally shortening the lease when renewing early.
+        let baseTime = max(current.expiresAt, now)
+        let newExpiry = baseTime.addingTimeInterval(duration)
 
         let newInfo = LockInfo(
             owner: owner,
             acquiredAt: current.acquiredAt,
-            expiresAt: Date().addingTimeInterval(duration)
+            expiresAt: newExpiry
         )
         try await storage.writeLockInfo(newInfo, path: path)
         _expiresAt = newInfo.expiresAt

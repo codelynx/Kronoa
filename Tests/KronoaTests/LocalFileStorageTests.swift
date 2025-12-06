@@ -145,4 +145,116 @@ final class LocalFileStorageTests: XCTestCase {
 
         try await lock.release()
     }
+
+    func testLockRenewalDoesNotShortenLease() async throws {
+        // Acquire lock with 60 second lease
+        let lock = try await storage.acquireLock(
+            path: ".lock",
+            timeout: 5,
+            leaseDuration: 60
+        )
+
+        let originalExpiry = await lock.expiresAt
+
+        // Renew with a shorter duration - should extend from current expiry, not now
+        try await lock.renew(duration: 5)
+
+        let newExpiry = await lock.expiresAt
+
+        // New expiry should be greater than original (extended from original expiry)
+        // Not shortened to now + 5 seconds
+        XCTAssertGreaterThan(newExpiry, originalExpiry)
+
+        try await lock.release()
+    }
+
+    // MARK: - Path Validation
+
+    func testReadRejectsAbsolutePath() async throws {
+        do {
+            _ = try await storage.read(path: "/etc/passwd")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("Absolute"))
+        }
+    }
+
+    func testWriteRejectsPathTraversal() async throws {
+        do {
+            try await storage.write(path: "../escape.txt", data: Data())
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("traversal"))
+        }
+    }
+
+    func testDeleteRejectsPathTraversal() async throws {
+        do {
+            try await storage.delete(path: "foo/../../escape.txt")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("traversal"))
+        }
+    }
+
+    func testExistsRejectsAbsolutePath() async throws {
+        do {
+            _ = try await storage.exists(path: "/tmp/test")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("Absolute"))
+        }
+    }
+
+    func testListRejectsPathTraversal() async throws {
+        do {
+            _ = try await storage.list(prefix: "../", delimiter: "/")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("traversal"))
+        }
+    }
+
+    func testAtomicIncrementRejectsPathTraversal() async throws {
+        do {
+            _ = try await storage.atomicIncrement(path: "../counter", initialValue: 10000)
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("traversal"))
+        }
+    }
+
+    func testAcquireLockRejectsAbsolutePath() async throws {
+        do {
+            _ = try await storage.acquireLock(path: "/tmp/.lock", timeout: 1, leaseDuration: 5)
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("Absolute"))
+        }
+    }
+
+    func testRejectsCurrentDirectoryReference() async throws {
+        do {
+            _ = try await storage.read(path: "./file.txt")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("Current directory"))
+        }
+    }
+
+    func testRejectsEmptyPath() async throws {
+        do {
+            _ = try await storage.read(path: "")
+            XCTFail("Expected invalidPath error")
+        } catch StorageError.invalidPath(let msg) {
+            XCTAssertTrue(msg.contains("empty"))
+        }
+    }
+
+    func testListAllowsEmptyPrefix() async throws {
+        // Empty prefix is valid for list (means list root)
+        try await storage.write(path: "root-file.txt", data: Data())
+        let entries = try await storage.list(prefix: "", delimiter: "/")
+        XCTAssertTrue(entries.contains("root-file.txt"))
+    }
 }
