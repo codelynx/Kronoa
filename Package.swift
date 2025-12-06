@@ -40,5 +40,12 @@ let package = Package(
             name: "KronoaTests",
             dependencies: ["Kronoa"]
         ),
+        .testTarget(
+            name: "CLITests",
+            dependencies: [
+                "KronoaCLI",
+                "Kronoa",
+            ]
+        ),
     ]
 )
