@@ -178,6 +178,118 @@ struct ContentSessionTests {
         }
     }
 
+    // MARK: - Local Changes Tests
+
+    @Test("localChanges returns set and deleted files")
+    func localChangesReturnsSetAndDeleted() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create edition with some changes
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "changes-test")
+        let editionId = await session.editionId
+
+        // Write a file
+        try await session.write(path: "new-file.txt", data: "content".data(using: .utf8)!)
+
+        // Create a file in genesis to delete
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "old content".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/to-delete.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        // Delete it
+        try await session.delete(path: "to-delete.txt")
+
+        // Get local changes
+        let changes = try await session.localChanges(in: editionId)
+
+        #expect(changes.count == 2)
+
+        let newFile = changes.first { $0.path == "new-file.txt" }
+        #expect(newFile != nil)
+        #expect(newFile?.change == .set)
+        #expect(newFile?.hash != nil)
+
+        let deletedFile = changes.first { $0.path == "to-delete.txt" }
+        #expect(deletedFile != nil)
+        #expect(deletedFile?.change == .deleted)
+        #expect(deletedFile?.hash == nil)
+    }
+
+    @Test("localChanges returns empty for genesis edition")
+    func localChangesEmptyForGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        // Genesis has only .flattened, no content files
+        let changes = try await session.localChanges(in: 10000)
+
+        #expect(changes.isEmpty)
+    }
+
+    @Test("localChanges excludes metadata files")
+    func localChangesExcludesMetadata() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "meta-test")
+        let editionId = await session.editionId
+
+        // Write a regular file
+        try await session.write(path: "readme.md", data: "# Hello".data(using: .utf8)!)
+
+        let changes = try await session.localChanges(in: editionId)
+
+        // Should only have readme.md, not .origin
+        #expect(changes.count == 1)
+        #expect(changes[0].path == "readme.md")
+    }
+
+    @Test("localChanges throws for non-existent edition")
+    func localChangesThrowsForNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await session.localChanges(in: 99999)
+        }
+    }
+
+    @Test("localChanges returns sorted by path")
+    func localChangesSortedByPath() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "sort-test")
+        let editionId = await session.editionId
+
+        // Write files in non-sorted order
+        try await session.write(path: "z-file.txt", data: "z".data(using: .utf8)!)
+        try await session.write(path: "a-file.txt", data: "a".data(using: .utf8)!)
+        try await session.write(path: "m-file.txt", data: "m".data(using: .utf8)!)
+
+        let changes = try await session.localChanges(in: editionId)
+
+        #expect(changes.count == 3)
+        #expect(changes[0].path == "a-file.txt")
+        #expect(changes[1].path == "m-file.txt")
+        #expect(changes[2].path == "z-file.txt")
+    }
+
     // MARK: - Checkout Tests
 
     @Test("Checkout creates new edition")

@@ -27,6 +27,7 @@ Editions are immutable snapshots identified by numeric IDs (starting at 10000). 
 | Production | Yes | No | Live content serving |
 | Staging | Yes | No | Review before publish |
 | Editing | Yes | Yes | Active content creation |
+| Edition(id) | Yes | No | Preview pending, view history |
 
 ## Storage Layout
 
@@ -380,6 +381,74 @@ try admin.deploy()
 **Validation:** Only checks that `editions/{id}/` directory exists. Does NOT verify the edition was previously staged - this is admin responsibility. Pointing to a never-staged edition would leave its objects without `.ref` entries, making them GC candidates after grace period.
 
 **Safety note:** Only use for editions that were previously staged. Their objects are already tracked in `.ref` files from the original staging operation.
+
+### Reject (Admin Action)
+
+```swift
+try admin.reject(edition: 10001, reason: "Needs revision")
+```
+
+1. Verify `.pending/10001.json` exists
+2. Move to `.rejected/10001.json` with rejection metadata:
+   ```json
+   {
+     "edition": 10001,
+     "reason": "Needs revision",
+     "rejectedAt": "2025-01-15T11:00:00Z"
+   }
+   ```
+3. Delete `.pending/10001.json`
+
+Editor can view rejection via `getRejection(edition:)` and resubmit with a fresh checkout.
+
+### Admin Review Workflow
+
+Admin reviewing a pending submission can:
+
+1. **See what changed** using `localChanges(in:)`:
+   ```swift
+   let pending = try await admin.listPending().first!
+   let changes = try await admin.localChanges(in: pending.edition)
+   // Returns: [LocalChange(path, .set/.deleted, hash)]
+   ```
+
+2. **Preview content** using `.edition(id:)` mode:
+   ```swift
+   let preview = try await ContentSession(storage: s, mode: .edition(id: pending.edition))
+   let content = try await preview.read(path: "article.md")
+   ```
+
+3. **Compare with base** using `origin(of:)`:
+   ```swift
+   guard let baseId = try await admin.origin(of: pending.edition) else { return }
+   let baseSession = try await ContentSession(storage: s, mode: .edition(id: baseId))
+   // Compare file-by-file using stat() hashes
+   ```
+
+### Revision After Rejection
+
+When a submission is rejected, the editor can revise and resubmit:
+
+1. **Read rejected work** via `.edition(id:)` mode
+2. **Start fresh checkout** from current staging
+3. **Copy/fix content** from rejected edition
+4. **Submit** with message referencing the rejection
+
+```swift
+// Editor reads their rejected submission
+let rejected = try await ContentSession(storage: s, mode: .edition(id: 10001))
+let content = try await rejected.read(path: "article.md")
+
+// Editor starts fresh from staging
+try await editor.checkout(label: "draft-2")  // Creates 10002
+
+// Editor fixes and resubmits
+let fixedContent = applyFixes(content)
+try await editor.write(path: "article.md", data: fixedContent)
+try await editor.submit(message: "Revised article (fixes rejection 10001)")
+```
+
+This creates a new immutable edition (10002) rather than modifying the rejected one, preserving full audit history.
 
 ### Lock Implementation with Lease
 

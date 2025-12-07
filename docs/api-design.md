@@ -226,6 +226,39 @@ if pendingStat.hash != baseStat.hash {
 }
 ```
 
+```swift
+/// List files changed locally in an edition (not inherited from ancestors).
+///
+/// Returns only files explicitly stored in the edition's directory,
+/// showing what was set (added/modified) or deleted (tombstoned).
+/// This is O(n) where n = files in the edition, not total files in ancestry.
+///
+/// - Returns: List of local changes sorted by path
+/// - Throws: `editionNotFound`, `integrityError`, `storageError`
+func localChanges(in edition: Int) async throws -> [LocalChange]
+
+struct LocalChange {
+    let path: String
+    let change: LocalChangeType  // .set or .deleted
+    let hash: String?            // nil for deleted
+}
+```
+
+Example: Admin reviewing what a submission changed:
+```swift
+let pending = try await session.listPending().first!
+let changes = try await session.localChanges(in: pending.edition)
+
+for change in changes {
+    switch change.change {
+    case .set:
+        print("SET \(change.path) → \(change.hash!)")
+    case .deleted:
+        print("DEL \(change.path)")
+    }
+}
+```
+
 ### Admin Operations
 
 ```swift
@@ -383,6 +416,24 @@ struct PendingSubmission: Codable {
     let label: String
     let message: String
     let submittedAt: Date
+}
+
+struct RejectedSubmission: Codable {
+    let edition: Int
+    let reason: String
+    let rejectedAt: Date
+}
+
+/// A file change local to a specific edition (not inherited).
+struct LocalChange {
+    let path: String
+    let change: LocalChangeType
+    let hash: String?  // nil for deleted
+}
+
+enum LocalChangeType {
+    case set      // file was added or modified
+    case deleted  // file was deleted (tombstone)
 }
 
 struct LockInfo: Codable {

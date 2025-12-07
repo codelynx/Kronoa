@@ -1239,6 +1239,77 @@ public actor ContentSession {
         return try await getParentEdition(edition)
     }
 
+    /// List files changed locally in an edition (not inherited from ancestors).
+    ///
+    /// Returns only files explicitly stored in the edition's directory,
+    /// showing what was set (added/modified) or deleted (tombstoned).
+    ///
+    /// This is O(n) where n = files in the edition, not total files in ancestry.
+    ///
+    /// - Parameter edition: Edition ID to inspect
+    /// - Returns: List of local changes (set or deleted), sorted by path
+    /// - Throws: `editionNotFound`, `integrityError`, `storageError`
+    public func localChanges(in edition: Int) async throws -> [LocalChange] {
+        // Verify edition exists
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        do {
+            let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+            let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+            if !hasOrigin && !hasFlattened {
+                throw ContentError.editionNotFound(edition: edition)
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // List all files in edition directory
+        let entries: [String]
+        do {
+            entries = try await storage.list(prefix: editionPath, delimiter: nil)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var changes: [LocalChange] = []
+
+        for entry in entries {
+            // Skip metadata files
+            let filename = String(entry.dropFirst(editionPath.count))
+            if filename.hasPrefix(".") {
+                continue
+            }
+
+            // Read path file content
+            let content: Data
+            do {
+                content = try await storage.read(path: entry)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw ContentError.integrityError(
+                    expected: "valid UTF-8 content",
+                    actual: "invalid UTF-8 in \(entry)"
+                )
+            }
+
+            if text == "deleted" {
+                changes.append(LocalChange(path: filename, change: .deleted, hash: nil))
+            } else if text.hasPrefix("sha256:") {
+                let hash = String(text.dropFirst(7))
+                changes.append(LocalChange(path: filename, change: .set, hash: hash))
+            } else {
+                throw ContentError.integrityError(
+                    expected: "sha256:<hash> or deleted",
+                    actual: "'\(text)' in \(entry)"
+                )
+            }
+        }
+
+        return changes.sorted { $0.path < $1.path }
+    }
+
     // MARK: - Maintenance Operations
 
     /// Flatten an edition by copying all ancestor mappings into it.
