@@ -25,9 +25,13 @@ DerivedData/
 
 # IDE
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+
+# Kronoa local data
+.kronoa/
 
 # Credentials
 .credentials/

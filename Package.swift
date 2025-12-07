@@ -19,7 +19,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.0.0"),
+        .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.6.11"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
     ],
     targets: [
