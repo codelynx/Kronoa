@@ -65,16 +65,16 @@ This allows zero-byte files to be stored (hash of empty content).
 
 ## Lifecycle
 
-### Initial State
+### Initial State (Genesis Bootstrap)
 
 ```
 editions/.head = 10000
-editions/10000/ (empty)
+editions/10000/.flattened = (empty file)
 .production.json = { "edition": 10000 }
 .staging.json = { "edition": 10000 }
 ```
 
-No content exists. Production/staging modes are read-only; all reads return "not found".
+The genesis edition (10000) must have a `.flattened` marker to indicate it has no ancestors. This is required for edition existence validation. No content exists initially; all reads return "not found".
 
 ### Checkout (Start Editing)
 

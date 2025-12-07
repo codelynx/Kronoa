@@ -17,10 +17,14 @@ struct ContentSessionTests {
     func setupStorage() async throws -> LocalFileStorage {
         let storage = try LocalFileStorage(root: tempDir)
 
-        // Create genesis edition 10000
+        // Create genesis edition 10000 with .flattened marker (no ancestors)
         try await storage.write(
             path: "contents/editions/.head",
             data: "10000".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/.flattened",
+            data: Data()
         )
         try await storage.write(
             path: "contents/.production.json",
@@ -63,6 +67,57 @@ struct ContentSessionTests {
 
         #expect(await session.mode == .staging)
         #expect(await session.editionId == 10000)
+    }
+
+    @Test("Initialize session in edition mode for genesis")
+    func initEditionModeGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Should work for genesis edition (has .flattened marker)
+        let session = try await ContentSession(storage: storage, mode: .edition(id: 10000))
+
+        #expect(await session.mode == .edition(id: 10000))
+        #expect(await session.editionId == 10000)
+        #expect(await session.baseEditionId == nil)
+    }
+
+    @Test("Initialize session in edition mode for non-existent edition throws")
+    func initEditionModeNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await ContentSession(storage: storage, mode: .edition(id: 99999))
+        }
+    }
+
+    @Test("Edition mode provides read-only access to any edition")
+    func editionModeReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create some content in genesis
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "hello".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/test.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        // Access via .edition mode
+        let session = try await ContentSession(storage: storage, mode: .edition(id: 10000))
+        let data = try await session.read(path: "test.txt")
+
+        #expect(String(data: data, encoding: .utf8) == "hello")
+
+        // Verify it's read-only
+        await #expect(throws: ContentError.readOnlyMode) {
+            try await session.write(path: "new.txt", data: "data".data(using: .utf8)!)
+        }
     }
 
     // MARK: - Checkout Tests

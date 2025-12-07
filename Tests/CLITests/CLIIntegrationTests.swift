@@ -77,10 +77,14 @@ final class CLITestEnvironment {
     func setupStorage() async throws -> LocalFileStorage {
         let storage = LocalFileStorage(root: storageDir)
 
-        // Create genesis edition 10000
+        // Create genesis edition 10000 with .flattened marker (no ancestors)
         try await storage.write(
             path: "contents/editions/.head",
             data: "10000".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/.flattened",
+            data: Data()
         )
         try await storage.write(
             path: "contents/.production.json",

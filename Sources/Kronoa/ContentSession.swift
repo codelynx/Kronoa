@@ -62,9 +62,10 @@ public actor ContentSession {
     ///
     /// - Parameters:
     ///   - storage: Storage backend to use
-    ///   - mode: Session mode (.production, .staging, or .editing(label:) to resume)
+    ///   - mode: Session mode (.production, .staging, .editing(label:) to resume, or .edition(id:) for direct access)
     /// - Throws: `ContentError.storageError` if edition pointer cannot be read,
-    ///           `ContentError.notFound` if editing session doesn't exist
+    ///           `ContentError.notFound` if editing session doesn't exist,
+    ///           `ContentError.editionNotFound` if edition doesn't exist (for .edition mode)
     public init(storage: StorageBackend, mode: SessionMode) async throws {
         self.storage = storage
 
@@ -106,6 +107,17 @@ public actor ContentSession {
         case .edition(let id):
             // Read-only access to a specific edition by ID
             // Useful for previewing pending editions or viewing history
+            // Verify edition exists: check .origin (normal) or .flattened (genesis/flattened)
+            let editionPath = "contents/editions/\(id)/"
+            do {
+                let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+                let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+                if !hasOrigin && !hasFlattened {
+                    throw ContentError.editionNotFound(edition: id)
+                }
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
             self._mode = mode
             self._editionId = id
             self._baseEditionId = nil

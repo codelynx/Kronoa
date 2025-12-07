@@ -50,6 +50,7 @@ enum SessionMode {
     case staging     // read-only, serves .staging.json edition
     case editing(label: String)  // read-write, serves .{label}.json edition
     case submitted   // read-only, edition submitted for review
+    case edition(id: Int)  // read-only, direct access to any edition by ID
 }
 
 enum CheckoutSource {
@@ -62,6 +63,22 @@ session.editionId // current edition number
 session.baseEditionId // edition this was branched from (editing mode)
 session.checkoutSource // .staging or .production (editing mode)
 ```
+
+#### Direct Edition Access
+
+Use `.edition(id:)` mode to access any edition by ID without knowing internal storage details:
+
+```swift
+// Preview a pending submission before approving
+let preview = try await ContentSession(storage: storage, mode: .edition(id: 10004))
+let data = try await preview.read(path: "articles/draft.md")
+let files = try await preview.list(directory: "articles/")
+
+// View historical edition
+let history = try await ContentSession(storage: storage, mode: .edition(id: 10001))
+```
+
+This mode is read-only and throws `editionNotFound` if the edition doesn't exist.
 
 ### Editor Operations
 
