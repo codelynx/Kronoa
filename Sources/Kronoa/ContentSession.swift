@@ -1209,6 +1209,36 @@ public actor ContentSession {
         }
     }
 
+    // MARK: - Edition Info
+
+    /// Get the origin (parent) edition ID for a given edition.
+    ///
+    /// Useful for comparing a pending edition against its base.
+    ///
+    /// - Parameter edition: Edition ID to query
+    /// - Returns: Parent edition ID, or nil for genesis/flattened editions
+    /// - Throws: `ContentError.editionNotFound` if edition doesn't exist,
+    ///           `ContentError.integrityError` for malformed .origin
+    public func origin(of edition: Int) async throws -> Int? {
+        // Verify edition exists
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        do {
+            let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+            let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+            if !hasOrigin && !hasFlattened {
+                throw ContentError.editionNotFound(edition: edition)
+            }
+            // Flattened editions have no traversable parent
+            if hasFlattened {
+                return nil
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        return try await getParentEdition(edition)
+    }
+
     // MARK: - Maintenance Operations
 
     /// Flatten an edition by copying all ancestor mappings into it.

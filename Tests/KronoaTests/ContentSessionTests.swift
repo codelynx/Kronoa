@@ -120,6 +120,64 @@ struct ContentSessionTests {
         }
     }
 
+    // MARK: - Origin Tests
+
+    @Test("origin(of:) returns parent for normal edition")
+    func originReturnsParent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create an edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "child")
+        let childId = await session.editionId  // 10001
+
+        // Query origin
+        let parent = try await session.origin(of: childId)
+        #expect(parent == 10000)
+    }
+
+    @Test("origin(of:) returns nil for genesis edition")
+    func originReturnsNilForGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        // Genesis has .flattened, so origin returns nil
+        let parent = try await session.origin(of: 10000)
+        #expect(parent == nil)
+    }
+
+    @Test("origin(of:) returns nil for flattened edition")
+    func originReturnsNilForFlattened() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and flatten an edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "to-flatten")
+        let editionId = await session.editionId
+        try await session.write(path: "test.txt", data: "test".data(using: .utf8)!)
+        try await session.flatten(edition: editionId)
+
+        // After flattening, origin returns nil
+        let parent = try await session.origin(of: editionId)
+        #expect(parent == nil)
+    }
+
+    @Test("origin(of:) throws for non-existent edition")
+    func originThrowsForNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await session.origin(of: 99999)
+        }
+    }
+
     // MARK: - Checkout Tests
 
     @Test("Checkout creates new edition")

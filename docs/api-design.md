@@ -195,6 +195,37 @@ try await session.endEditing()  // writes objects and path files
 - Partial editions are never referenced by staging/production
 - Editor can retry or abandon; orphan editions cleaned by GC
 
+### Edition Info
+
+```swift
+/// Get the origin (parent) edition ID for a given edition.
+///
+/// Useful for comparing a pending edition against its base.
+///
+/// - Returns: Parent edition ID, or nil for genesis/flattened editions
+/// - Throws: `editionNotFound`, `integrityError`, `storageError`
+func origin(of edition: Int) async throws -> Int?
+```
+
+Example: Comparing pending edition against its base:
+```swift
+let pending = try await session.listPending().first!
+guard let baseId = try await session.origin(of: pending.edition) else {
+    // Edition is genesis or flattened - no base to compare
+    return
+}
+
+let pendingSession = try await ContentSession(storage: s, mode: .edition(id: pending.edition))
+let baseSession = try await ContentSession(storage: s, mode: .edition(id: baseId))
+
+// Compare files using stat() hashes
+let pendingStat = try await pendingSession.stat(path: "article.md")
+let baseStat = try await baseSession.stat(path: "article.md")
+if pendingStat.hash != baseStat.hash {
+    // File was modified
+}
+```
+
 ### Admin Operations
 
 ```swift
