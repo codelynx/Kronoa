@@ -10,6 +10,8 @@ public enum SessionMode: Equatable, Sendable {
     case editing(label: String)
     /// Read-only, edition submitted for review
     case submitted
+    /// Read-only, serves a specific edition by ID (for preview/history)
+    case edition(id: Int)
 }
 
 /// Source to branch from when checking out.

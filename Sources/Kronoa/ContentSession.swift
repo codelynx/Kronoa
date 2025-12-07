@@ -102,6 +102,14 @@ public actor ContentSession {
 
         case .submitted:
             fatalError("Cannot initialize with .submitted mode")
+
+        case .edition(let id):
+            // Read-only access to a specific edition by ID
+            // Useful for previewing pending editions or viewing history
+            self._mode = mode
+            self._editionId = id
+            self._baseEditionId = nil
+            self._checkoutSource = nil
         }
     }
 
@@ -133,7 +141,7 @@ public actor ContentSession {
         switch _mode {
         case .production, .staging:
             break
-        case .editing, .submitted:
+        case .editing, .submitted, .edition:
             throw ContentError.notInEditingMode
         }
 
