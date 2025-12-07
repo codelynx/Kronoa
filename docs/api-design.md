@@ -50,6 +50,7 @@ enum SessionMode {
     case staging     // read-only, serves .staging.json edition
     case editing(label: String)  // read-write, serves .{label}.json edition
     case submitted   // read-only, edition submitted for review
+    case edition(id: Int)  // read-only, direct access to any edition by ID
 }
 
 enum CheckoutSource {
@@ -62,6 +63,22 @@ session.editionId // current edition number
 session.baseEditionId // edition this was branched from (editing mode)
 session.checkoutSource // .staging or .production (editing mode)
 ```
+
+#### Direct Edition Access
+
+Use `.edition(id:)` mode to access any edition by ID without knowing internal storage details:
+
+```swift
+// Preview a pending submission before approving
+let preview = try await ContentSession(storage: storage, mode: .edition(id: 10004))
+let data = try await preview.read(path: "articles/draft.md")
+let files = try await preview.list(directory: "articles/")
+
+// View historical edition
+let history = try await ContentSession(storage: storage, mode: .edition(id: 10001))
+```
+
+This mode is read-only and throws `editionNotFound` if the edition doesn't exist.
 
 ### Editor Operations
 
@@ -177,6 +194,70 @@ try await session.endEditing()  // writes objects and path files
 - If `endEditing()` fails mid-write, edition may have partial state
 - Partial editions are never referenced by staging/production
 - Editor can retry or abandon; orphan editions cleaned by GC
+
+### Edition Info
+
+```swift
+/// Get the origin (parent) edition ID for a given edition.
+///
+/// Useful for comparing a pending edition against its base.
+///
+/// - Returns: Parent edition ID, or nil for genesis/flattened editions
+/// - Throws: `editionNotFound`, `integrityError`, `storageError`
+func origin(of edition: Int) async throws -> Int?
+```
+
+Example: Comparing pending edition against its base:
+```swift
+let pending = try await session.listPending().first!
+guard let baseId = try await session.origin(of: pending.edition) else {
+    // Edition is genesis or flattened - no base to compare
+    return
+}
+
+let pendingSession = try await ContentSession(storage: s, mode: .edition(id: pending.edition))
+let baseSession = try await ContentSession(storage: s, mode: .edition(id: baseId))
+
+// Compare files using stat() hashes
+let pendingStat = try await pendingSession.stat(path: "article.md")
+let baseStat = try await baseSession.stat(path: "article.md")
+if pendingStat.hash != baseStat.hash {
+    // File was modified
+}
+```
+
+```swift
+/// List files changed locally in an edition (not inherited from ancestors).
+///
+/// Returns only files explicitly stored in the edition's directory,
+/// showing what was set (added/modified) or deleted (tombstoned).
+/// This is O(n) where n = files in the edition, not total files in ancestry.
+///
+/// - Returns: List of local changes sorted by path
+/// - Throws: `editionNotFound`, `integrityError`, `storageError`
+func localChanges(in edition: Int) async throws -> [LocalChange]
+
+struct LocalChange {
+    let path: String
+    let change: LocalChangeType  // .set or .deleted
+    let hash: String?            // nil for deleted
+}
+```
+
+Example: Admin reviewing what a submission changed:
+```swift
+let pending = try await session.listPending().first!
+let changes = try await session.localChanges(in: pending.edition)
+
+for change in changes {
+    switch change.change {
+    case .set:
+        print("SET \(change.path) → \(change.hash!)")
+    case .deleted:
+        print("DEL \(change.path)")
+    }
+}
+```
 
 ### Admin Operations
 
@@ -335,6 +416,24 @@ struct PendingSubmission: Codable {
     let label: String
     let message: String
     let submittedAt: Date
+}
+
+struct RejectedSubmission: Codable {
+    let edition: Int
+    let reason: String
+    let rejectedAt: Date
+}
+
+/// A file change local to a specific edition (not inherited).
+struct LocalChange {
+    let path: String
+    let change: LocalChangeType
+    let hash: String?  // nil for deleted
+}
+
+enum LocalChangeType {
+    case set      // file was added or modified
+    case deleted  // file was deleted (tombstone)
 }
 
 struct LockInfo: Codable {

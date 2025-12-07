@@ -10,6 +10,8 @@ public enum SessionMode: Equatable, Sendable {
     case editing(label: String)
     /// Read-only, edition submitted for review
     case submitted
+    /// Read-only, serves a specific edition by ID (for preview/history)
+    case edition(id: Int)
 }
 
 /// Source to branch from when checking out.
@@ -121,6 +123,31 @@ public struct RejectedSubmission: Codable, Equatable, Sendable {
         self.reason = reason
         self.rejectedAt = rejectedAt
     }
+}
+
+/// A file change local to a specific edition (not inherited).
+/// Used by localChanges(in:) to show what an edition modified.
+public struct LocalChange: Equatable, Sendable {
+    /// File path relative to content root
+    public let path: String
+    /// Type of change
+    public let change: LocalChangeType
+    /// Content hash (nil for deleted)
+    public let hash: String?
+
+    public init(path: String, change: LocalChangeType, hash: String?) {
+        self.path = path
+        self.change = change
+        self.hash = hash
+    }
+}
+
+/// Type of local change in an edition.
+public enum LocalChangeType: Equatable, Sendable {
+    /// File was added or modified (has content hash)
+    case set
+    /// File was deleted (tombstone)
+    case deleted
 }
 
 /// Result of garbage collection run.

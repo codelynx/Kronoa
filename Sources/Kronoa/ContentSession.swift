@@ -62,9 +62,10 @@ public actor ContentSession {
     ///
     /// - Parameters:
     ///   - storage: Storage backend to use
-    ///   - mode: Session mode (.production, .staging, or .editing(label:) to resume)
+    ///   - mode: Session mode (.production, .staging, .editing(label:) to resume, or .edition(id:) for direct access)
     /// - Throws: `ContentError.storageError` if edition pointer cannot be read,
-    ///           `ContentError.notFound` if editing session doesn't exist
+    ///           `ContentError.notFound` if editing session doesn't exist,
+    ///           `ContentError.editionNotFound` if edition doesn't exist (for .edition mode)
     public init(storage: StorageBackend, mode: SessionMode) async throws {
         self.storage = storage
 
@@ -102,6 +103,25 @@ public actor ContentSession {
 
         case .submitted:
             fatalError("Cannot initialize with .submitted mode")
+
+        case .edition(let id):
+            // Read-only access to a specific edition by ID
+            // Useful for previewing pending editions or viewing history
+            // Verify edition exists: check .origin (normal) or .flattened (genesis/flattened)
+            let editionPath = "contents/editions/\(id)/"
+            do {
+                let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+                let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+                if !hasOrigin && !hasFlattened {
+                    throw ContentError.editionNotFound(edition: id)
+                }
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+            self._mode = mode
+            self._editionId = id
+            self._baseEditionId = nil
+            self._checkoutSource = nil
         }
     }
 
@@ -133,7 +153,7 @@ public actor ContentSession {
         switch _mode {
         case .production, .staging:
             break
-        case .editing, .submitted:
+        case .editing, .submitted, .edition:
             throw ContentError.notInEditingMode
         }
 
@@ -1187,6 +1207,107 @@ public actor ContentSession {
         } catch let error as StorageError {
             throw ContentError.storageError(underlying: error)
         }
+    }
+
+    // MARK: - Edition Info
+
+    /// Get the origin (parent) edition ID for a given edition.
+    ///
+    /// Useful for comparing a pending edition against its base.
+    ///
+    /// - Parameter edition: Edition ID to query
+    /// - Returns: Parent edition ID, or nil for genesis/flattened editions
+    /// - Throws: `ContentError.editionNotFound` if edition doesn't exist,
+    ///           `ContentError.integrityError` for malformed .origin
+    public func origin(of edition: Int) async throws -> Int? {
+        // Verify edition exists
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        do {
+            let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+            let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+            if !hasOrigin && !hasFlattened {
+                throw ContentError.editionNotFound(edition: edition)
+            }
+            // Flattened editions have no traversable parent
+            if hasFlattened {
+                return nil
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        return try await getParentEdition(edition)
+    }
+
+    /// List files changed locally in an edition (not inherited from ancestors).
+    ///
+    /// Returns only files explicitly stored in the edition's directory,
+    /// showing what was set (added/modified) or deleted (tombstoned).
+    ///
+    /// This is O(n) where n = files in the edition, not total files in ancestry.
+    ///
+    /// - Parameter edition: Edition ID to inspect
+    /// - Returns: List of local changes (set or deleted), sorted by path
+    /// - Throws: `editionNotFound`, `integrityError`, `storageError`
+    public func localChanges(in edition: Int) async throws -> [LocalChange] {
+        // Verify edition exists
+        let editionPath = "\(editionsPrefix)\(edition)/"
+        do {
+            let hasOrigin = try await storage.exists(path: editionPath + ".origin")
+            let hasFlattened = try await storage.exists(path: editionPath + ".flattened")
+            if !hasOrigin && !hasFlattened {
+                throw ContentError.editionNotFound(edition: edition)
+            }
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        // List all files in edition directory
+        let entries: [String]
+        do {
+            entries = try await storage.list(prefix: editionPath, delimiter: nil)
+        } catch let error as StorageError {
+            throw ContentError.storageError(underlying: error)
+        }
+
+        var changes: [LocalChange] = []
+
+        for entry in entries {
+            // Skip metadata files
+            let filename = String(entry.dropFirst(editionPath.count))
+            if filename.hasPrefix(".") {
+                continue
+            }
+
+            // Read path file content
+            let content: Data
+            do {
+                content = try await storage.read(path: entry)
+            } catch let error as StorageError {
+                throw ContentError.storageError(underlying: error)
+            }
+
+            guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw ContentError.integrityError(
+                    expected: "valid UTF-8 content",
+                    actual: "invalid UTF-8 in \(entry)"
+                )
+            }
+
+            if text == "deleted" {
+                changes.append(LocalChange(path: filename, change: .deleted, hash: nil))
+            } else if text.hasPrefix("sha256:") {
+                let hash = String(text.dropFirst(7))
+                changes.append(LocalChange(path: filename, change: .set, hash: hash))
+            } else {
+                throw ContentError.integrityError(
+                    expected: "sha256:<hash> or deleted",
+                    actual: "'\(text)' in \(entry)"
+                )
+            }
+        }
+
+        return changes.sorted { $0.path < $1.path }
     }
 
     // MARK: - Maintenance Operations

@@ -17,10 +17,14 @@ struct ContentSessionTests {
     func setupStorage() async throws -> LocalFileStorage {
         let storage = try LocalFileStorage(root: tempDir)
 
-        // Create genesis edition 10000
+        // Create genesis edition 10000 with .flattened marker (no ancestors)
         try await storage.write(
             path: "contents/editions/.head",
             data: "10000".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/.flattened",
+            data: Data()
         )
         try await storage.write(
             path: "contents/.production.json",
@@ -63,6 +67,227 @@ struct ContentSessionTests {
 
         #expect(await session.mode == .staging)
         #expect(await session.editionId == 10000)
+    }
+
+    @Test("Initialize session in edition mode for genesis")
+    func initEditionModeGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Should work for genesis edition (has .flattened marker)
+        let session = try await ContentSession(storage: storage, mode: .edition(id: 10000))
+
+        #expect(await session.mode == .edition(id: 10000))
+        #expect(await session.editionId == 10000)
+        #expect(await session.baseEditionId == nil)
+    }
+
+    @Test("Initialize session in edition mode for non-existent edition throws")
+    func initEditionModeNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await ContentSession(storage: storage, mode: .edition(id: 99999))
+        }
+    }
+
+    @Test("Edition mode provides read-only access to any edition")
+    func editionModeReadOnly() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create some content in genesis
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "hello".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/test.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        // Access via .edition mode
+        let session = try await ContentSession(storage: storage, mode: .edition(id: 10000))
+        let data = try await session.read(path: "test.txt")
+
+        #expect(String(data: data, encoding: .utf8) == "hello")
+
+        // Verify it's read-only
+        await #expect(throws: ContentError.readOnlyMode) {
+            try await session.write(path: "new.txt", data: "data".data(using: .utf8)!)
+        }
+    }
+
+    // MARK: - Origin Tests
+
+    @Test("origin(of:) returns parent for normal edition")
+    func originReturnsParent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create an edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "child")
+        let childId = await session.editionId  // 10001
+
+        // Query origin
+        let parent = try await session.origin(of: childId)
+        #expect(parent == 10000)
+    }
+
+    @Test("origin(of:) returns nil for genesis edition")
+    func originReturnsNilForGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        // Genesis has .flattened, so origin returns nil
+        let parent = try await session.origin(of: 10000)
+        #expect(parent == nil)
+    }
+
+    @Test("origin(of:) returns nil for flattened edition")
+    func originReturnsNilForFlattened() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create and flatten an edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "to-flatten")
+        let editionId = await session.editionId
+        try await session.write(path: "test.txt", data: "test".data(using: .utf8)!)
+        try await session.flatten(edition: editionId)
+
+        // After flattening, origin returns nil
+        let parent = try await session.origin(of: editionId)
+        #expect(parent == nil)
+    }
+
+    @Test("origin(of:) throws for non-existent edition")
+    func originThrowsForNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await session.origin(of: 99999)
+        }
+    }
+
+    // MARK: - Local Changes Tests
+
+    @Test("localChanges returns set and deleted files")
+    func localChangesReturnsSetAndDeleted() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create edition with some changes
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "changes-test")
+        let editionId = await session.editionId
+
+        // Write a file
+        try await session.write(path: "new-file.txt", data: "content".data(using: .utf8)!)
+
+        // Create a file in genesis to delete
+        let hash = "abc123"
+        try await storage.write(
+            path: "contents/objects/ab/\(hash).dat",
+            data: "old content".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/to-delete.txt",
+            data: "sha256:\(hash)".data(using: .utf8)!
+        )
+
+        // Delete it
+        try await session.delete(path: "to-delete.txt")
+
+        // Get local changes
+        let changes = try await session.localChanges(in: editionId)
+
+        #expect(changes.count == 2)
+
+        let newFile = changes.first { $0.path == "new-file.txt" }
+        #expect(newFile != nil)
+        #expect(newFile?.change == .set)
+        #expect(newFile?.hash != nil)
+
+        let deletedFile = changes.first { $0.path == "to-delete.txt" }
+        #expect(deletedFile != nil)
+        #expect(deletedFile?.change == .deleted)
+        #expect(deletedFile?.hash == nil)
+    }
+
+    @Test("localChanges returns empty for genesis edition")
+    func localChangesEmptyForGenesis() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        // Genesis has only .flattened, no content files
+        let changes = try await session.localChanges(in: 10000)
+
+        #expect(changes.isEmpty)
+    }
+
+    @Test("localChanges excludes metadata files")
+    func localChangesExcludesMetadata() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create edition
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "meta-test")
+        let editionId = await session.editionId
+
+        // Write a regular file
+        try await session.write(path: "readme.md", data: "# Hello".data(using: .utf8)!)
+
+        let changes = try await session.localChanges(in: editionId)
+
+        // Should only have readme.md, not .origin
+        #expect(changes.count == 1)
+        #expect(changes[0].path == "readme.md")
+    }
+
+    @Test("localChanges throws for non-existent edition")
+    func localChangesThrowsForNonExistent() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        await #expect(throws: ContentError.editionNotFound(edition: 99999)) {
+            _ = try await session.localChanges(in: 99999)
+        }
+    }
+
+    @Test("localChanges returns sorted by path")
+    func localChangesSortedByPath() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "sort-test")
+        let editionId = await session.editionId
+
+        // Write files in non-sorted order
+        try await session.write(path: "z-file.txt", data: "z".data(using: .utf8)!)
+        try await session.write(path: "a-file.txt", data: "a".data(using: .utf8)!)
+        try await session.write(path: "m-file.txt", data: "m".data(using: .utf8)!)
+
+        let changes = try await session.localChanges(in: editionId)
+
+        #expect(changes.count == 3)
+        #expect(changes[0].path == "a-file.txt")
+        #expect(changes[1].path == "m-file.txt")
+        #expect(changes[2].path == "z-file.txt")
     }
 
     // MARK: - Checkout Tests
