@@ -447,12 +447,34 @@ public actor ContentSession {
     /// - Returns: Array of entry names sorted lexicographically
     /// - Throws: `ContentError.invalidPath` for malformed paths
     public func list(directory: String) async throws -> [String] {
-        let entries = try await listInternal(directory: directory)
-        return entries.sorted()
+        let entries = try await listInternalWithInfo(directory: directory)
+        return entries.keys.sorted()
     }
 
-    /// Internal list implementation (transaction-aware).
-    private func listInternal(directory: String) async throws -> Set<String> {
+    /// List directory contents with metadata (hash and source edition).
+    ///
+    /// Returns immediate children only (files and subdirectories).
+    /// For files, includes the content hash. For directories, hash is nil.
+    /// Merges results from ancestry chain, with child editions overriding parents.
+    /// Excludes tombstoned (deleted) entries.
+    ///
+    /// - Parameter directory: Directory path (e.g., "articles/") or "" for root
+    /// - Returns: Array of ListEntry sorted by name
+    /// - Throws: `ContentError.invalidPath` for malformed paths
+    public func listWithMetadata(directory: String) async throws -> [ListEntry] {
+        let entries = try await listInternalWithInfo(directory: directory)
+        return entries.map { name, info in
+            ListEntry(
+                name: name,
+                isDirectory: name.hasSuffix("/"),
+                hash: info.hash,
+                resolvedFrom: info.edition
+            )
+        }.sorted { $0.name < $1.name }
+    }
+
+    /// Internal list implementation with full entry info (transaction-aware).
+    private func listInternalWithInfo(directory: String) async throws -> [String: EntryInfo] {
         // Validate directory path (allow empty for root)
         if !directory.isEmpty {
             // Remove trailing slash for validation
@@ -543,21 +565,36 @@ public actor ContentSession {
 
                     // Only record if not already seen (child overrides parent)
                     if allEntries[entryName] == nil {
-                        // For files, check if tombstoned
+                        // For files, check if tombstoned and extract hash
                         if !entryName.hasSuffix("/") {
                             let pathFile = "\(editionsPrefix)\(currentEdition)/\(normalizedDir)\(entryName)"
                             do {
                                 let content = try await storage.read(path: pathFile)
-                                if let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                                    let isDeleted = text == "deleted"
-                                    allEntries[entryName] = EntryInfo(edition: currentEdition, isDeleted: isDeleted)
+                                guard let text = String(data: content, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                                    throw ContentError.integrityError(
+                                        expected: "valid UTF-8 content",
+                                        actual: "invalid UTF-8 in \(pathFile)"
+                                    )
                                 }
-                            } catch {
-                                // Skip entries we can't read
+                                if text == "deleted" {
+                                    allEntries[entryName] = EntryInfo(edition: currentEdition, isDeleted: true, hash: nil)
+                                } else if text.hasPrefix("sha256:") {
+                                    let hash = String(text.dropFirst(7))
+                                    allEntries[entryName] = EntryInfo(edition: currentEdition, isDeleted: false, hash: hash)
+                                } else {
+                                    throw ContentError.integrityError(
+                                        expected: "sha256:<hash> or deleted",
+                                        actual: "'\(text)' in \(pathFile)"
+                                    )
+                                }
+                            } catch let error as ContentError {
+                                throw error
+                            } catch let error as StorageError {
+                                throw ContentError.storageError(underlying: error)
                             }
                         } else {
                             // Directory - mark as existing (will filter later based on contents)
-                            allEntries[entryName] = EntryInfo(edition: currentEdition, isDeleted: false)
+                            allEntries[entryName] = EntryInfo(edition: currentEdition, isDeleted: false, hash: nil)
                         }
                     }
                 }
@@ -574,11 +611,19 @@ public actor ContentSession {
 
         // Merge pending entries (they take precedence)
         for (name, isDeleted) in pendingEntries {
-            allEntries[name] = EntryInfo(edition: _editionId, isDeleted: isDeleted)
+            // Get hash from pending changes if it's a file
+            var hash: String? = nil
+            if !name.hasSuffix("/") && !isDeleted {
+                let fullPath = normalizedDir + name
+                if let change = _pendingChanges[fullPath], case .write(let h, _) = change.action {
+                    hash = h
+                }
+            }
+            allEntries[name] = EntryInfo(edition: _editionId, isDeleted: isDeleted, hash: hash)
         }
 
-        // Filter out deleted entries
-        return Set(allEntries.filter { !$0.value.isDeleted }.keys)
+        // Filter out deleted entries and return
+        return allEntries.filter { !$0.value.isDeleted }
     }
 
     // MARK: - Transactional Editing
@@ -1994,6 +2039,7 @@ public actor ContentSession {
 private struct EntryInfo {
     let edition: Int
     let isDeleted: Bool
+    let hash: String?  // nil for directories or deleted files
 }
 
 /// Buffered change in a transaction.

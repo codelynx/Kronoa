@@ -150,6 +150,25 @@ public enum LocalChangeType: Equatable, Sendable {
     case deleted
 }
 
+/// Entry returned by listWithMetadata().
+public struct ListEntry: Equatable, Sendable {
+    /// Entry name (file name or subdirectory name with trailing slash)
+    public let name: String
+    /// True if this is a subdirectory
+    public let isDirectory: Bool
+    /// Content hash (nil for directories)
+    public let hash: String?
+    /// Edition where this entry was resolved from
+    public let resolvedFrom: Int
+
+    public init(name: String, isDirectory: Bool, hash: String?, resolvedFrom: Int) {
+        self.name = name
+        self.isDirectory = isDirectory
+        self.hash = hash
+        self.resolvedFrom = resolvedFrom
+    }
+}
+
 /// Result of garbage collection run.
 public struct GCResult: Equatable, Sendable {
     /// Total objects scanned

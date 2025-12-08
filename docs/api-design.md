@@ -103,15 +103,19 @@ func exists(path: String) async throws -> Bool
 func stat(path: String) async throws -> FileStat
 
 /// List immediate children of a directory (merged from ancestry, excludes tombstones).
-/// Returns AsyncThrowingStream - pagination handled internally.
 /// - Parameter directory: Directory path (e.g., "articles/") or "" for root
-/// - Returns: AsyncThrowingStream yielding entry names in lexicographic order
-/// - Throws: `invalidPath` for malformed paths (thrown when iteration starts)
-/// - Note: Returns empty sequence for non-existent or empty directories (no `notFound` error).
-/// - Note: Only lists immediate children. To traverse subdirectories, call list() on each.
-/// - Warning: First `await` may block until full ancestry merge completes. Items are not
-///   streamed lazily from backend - all editions must be scanned before yielding begins.
-func list(directory: String) -> AsyncThrowingStream<String, Error>
+/// - Returns: Array of entry names sorted lexicographically
+/// - Throws: `invalidPath` for malformed paths
+/// - Note: Returns empty array for non-existent or empty directories (no `notFound` error).
+func list(directory: String) async throws -> [String]
+
+/// List directory contents with metadata (hash and source edition).
+/// Returns same entries as list(), but includes content hash for files and
+/// the edition ID where each entry was resolved from (useful for diff workflows).
+/// - Parameter directory: Directory path (e.g., "articles/") or "" for root
+/// - Returns: Array of ListEntry sorted by name
+/// - Throws: `invalidPath` for malformed paths
+func listWithMetadata(directory: String) async throws -> [ListEntry]
 
 /// Write file content (editing mode only, buffered until endEditing).
 /// - Throws: `invalidPath`, `readOnlyMode`
@@ -434,6 +438,14 @@ struct LocalChange {
 enum LocalChangeType {
     case set      // file was added or modified
     case deleted  // file was deleted (tombstone)
+}
+
+/// Entry returned by listWithMetadata().
+struct ListEntry {
+    let name: String       // file name or "subdir/"
+    let isDirectory: Bool
+    let hash: String?      // nil for directories
+    let resolvedFrom: Int  // edition where entry was found
 }
 
 struct LockInfo: Codable {
