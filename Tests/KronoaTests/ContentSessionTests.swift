@@ -653,6 +653,140 @@ struct ContentSessionTests {
         #expect(entries == ["from-child.md", "from-parent.md"])
     }
 
+    // MARK: - ListWithMetadata Tests
+
+    @Test("listWithMetadata returns hash and resolvedFrom for files")
+    func listWithMetadataReturnsHashAndEdition() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create files with known hashes
+        try await storage.write(
+            path: "contents/editions/10000/articles/post1.md",
+            data: "sha256:abc123".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/articles/post2.md",
+            data: "sha256:def456".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        let entries = try await session.listWithMetadata(directory: "articles/")
+
+        #expect(entries.count == 2)
+
+        let post1 = entries.first { $0.name == "post1.md" }
+        #expect(post1 != nil)
+        #expect(post1?.isDirectory == false)
+        #expect(post1?.hash == "abc123")
+        #expect(post1?.resolvedFrom == 10000)
+
+        let post2 = entries.first { $0.name == "post2.md" }
+        #expect(post2 != nil)
+        #expect(post2?.hash == "def456")
+    }
+
+    @Test("listWithMetadata returns nil hash for directories")
+    func listWithMetadataDirectoriesHaveNilHash() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Create a file in a subdirectory
+        try await storage.write(
+            path: "contents/editions/10000/docs/readme.md",
+            data: "sha256:abc".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        let entries = try await session.listWithMetadata(directory: "")
+
+        let docsDir = entries.first { $0.name == "docs/" }
+        #expect(docsDir != nil)
+        #expect(docsDir?.isDirectory == true)
+        #expect(docsDir?.hash == nil)
+    }
+
+    @Test("listWithMetadata shows correct resolvedFrom for ancestry")
+    func listWithMetadataShowsResolvedFromAncestry() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        // Parent edition (10000) has parent-file
+        try await storage.write(
+            path: "contents/editions/10000/parent-file.txt",
+            data: "sha256:parent".data(using: .utf8)!
+        )
+
+        // Child edition (10001) has child-file
+        try await storage.write(
+            path: "contents/editions/10001/.origin",
+            data: "10000".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10001/child-file.txt",
+            data: "sha256:child".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/.staging.json",
+            data: "{\"edition\":10001}".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+
+        let entries = try await session.listWithMetadata(directory: "")
+
+        let parentFile = entries.first { $0.name == "parent-file.txt" }
+        #expect(parentFile?.resolvedFrom == 10000)
+        #expect(parentFile?.hash == "parent")
+
+        let childFile = entries.first { $0.name == "child-file.txt" }
+        #expect(childFile?.resolvedFrom == 10001)
+        #expect(childFile?.hash == "child")
+    }
+
+    @Test("listWithMetadata includes pending writes with hash")
+    func listWithMetadataPendingWritesHaveHash() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        let session = try await ContentSession(storage: storage, mode: .staging)
+        try await session.checkout(label: "test")
+
+        // Write a file (buffered)
+        try await session.write(path: "new-file.txt", data: "hello".data(using: .utf8)!)
+
+        let entries = try await session.listWithMetadata(directory: "")
+
+        let newFile = entries.first { $0.name == "new-file.txt" }
+        #expect(newFile != nil)
+        #expect(newFile?.hash != nil)  // Should have computed hash
+        #expect(newFile?.resolvedFrom == 10001)  // Current editing edition
+    }
+
+    @Test("listWithMetadata excludes tombstoned files")
+    func listWithMetadataExcludesTombstones() async throws {
+        defer { cleanup() }
+        let storage = try await setupStorage()
+
+        try await storage.write(
+            path: "contents/editions/10000/visible.txt",
+            data: "sha256:abc".data(using: .utf8)!
+        )
+        try await storage.write(
+            path: "contents/editions/10000/deleted.txt",
+            data: "deleted".data(using: .utf8)!
+        )
+
+        let session = try await ContentSession(storage: storage, mode: .production)
+
+        let entries = try await session.listWithMetadata(directory: "")
+
+        #expect(entries.count == 1)
+        #expect(entries[0].name == "visible.txt")
+    }
+
     @Test("List returns empty for non-existent directory")
     func listEmptyDirectory() async throws {
         defer { cleanup() }
