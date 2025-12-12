@@ -185,6 +185,16 @@ public actor ContentSession {
                 baseEdition = try await Self.readEditionPointer(storage: storage, file: "contents/.staging.json")
             case .production:
                 baseEdition = try await Self.readEditionPointer(storage: storage, file: "contents/.production.json")
+            case .edition(let editionId):
+                // Verify the edition exists by checking for .origin or .flattened
+                let originPath = "\(editionsPrefix)\(editionId)/.origin"
+                let flattenedPath = "\(editionsPrefix)\(editionId)/.flattened"
+                let originExists = try? await storage.read(path: originPath)
+                let flattenedExists = try? await storage.read(path: flattenedPath)
+                guard originExists != nil || flattenedExists != nil else {
+                    throw ContentError.editionNotFound(edition: editionId)
+                }
+                baseEdition = editionId
             }
         } catch {
             // Clean up placeholder on failure
@@ -1074,6 +1084,9 @@ public actor ContentSession {
             currentPointer = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).staging.json")
         case .production:
             currentPointer = try await Self.readEditionPointer(storage: storage, file: "\(contentsPrefix).production.json")
+        case .edition(let sourceEdition):
+            // For edition-based checkout, base should match the source edition
+            currentPointer = sourceEdition
         }
 
         if submission.base != currentPointer {
