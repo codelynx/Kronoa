@@ -15,11 +15,13 @@ public enum SessionMode: Equatable, Sendable {
 }
 
 /// Source to branch from when checking out.
-public enum CheckoutSource: String, Codable, Equatable, Sendable {
+public enum CheckoutSource: Codable, Equatable, Sendable {
     /// Branch from current staging (default)
     case staging
     /// Branch from current production (for emergency fixes)
     case production
+    /// Branch from a specific edition (for rejected submissions or history)
+    case edition(Int)
 }
 
 /// File metadata returned by stat().
