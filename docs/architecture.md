@@ -2,7 +2,12 @@
 
 ## Overview
 
-Kronoa is a version-controlled content management system designed for newspaper/magazine-style publishing workflows. It provides Git-like semantics over a content-addressable storage backend, targeting AWS S3 (with local filesystem as development stub).
+Kronoa is a version-controlled content management system designed for newspaper/magazine-style publishing workflows. It provides Git-like semantics over a content-addressable storage backend, supporting multiple backends:
+- **LocalFileStorage** - Local filesystem (development)
+- **S3Storage** - AWS S3 (production)
+- **HTTPStorageBackend** - HTTP client for remote dev access (DEBUG only, read-only)
+
+See [HTTP Storage Backend RFC](http-storage-backend.md) for dev server setup.
 
 ## Core Concepts
 

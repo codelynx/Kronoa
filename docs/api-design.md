@@ -2,7 +2,7 @@
 
 ## Storage Protocol
 
-Abstract interface for S3/local filesystem interchangeability:
+Abstract interface for storage backend interchangeability (local filesystem, S3, HTTP):
 
 ```swift
 protocol StorageBackend {
@@ -38,6 +38,7 @@ protocol LockHandle {
 ```swift
 let storage = LocalFileStorage(root: "/path/to/root")
 // or: let storage = S3Storage(bucket: "my-bucket", prefix: "contents")
+// or: let storage = HTTPStorageBackend(baseURL: devServerURL)  // DEBUG only
 
 let session = try await ContentSession(storage: storage, mode: .production)
 ```
