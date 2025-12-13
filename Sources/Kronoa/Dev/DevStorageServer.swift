@@ -429,11 +429,15 @@ public class DevStorageServer: ObservableObject {
 		guard !components.isEmpty else { return nil }
 		guard !components.contains("..") else { return nil }
 
-		// Allow known Kronoa dotfiles
+		// Allow known Kronoa dotfiles and metadata prefixes
 		let allowedDotFiles = [".production.json", ".staging.json", ".origin", ".flattened", ".head"]
+		let allowedDotPrefixes = [".catalog"]  // Metadata directories
 		for component in components {
 			if component.hasPrefix(".") {
-				guard allowedDotFiles.contains(String(component)) else { return nil }
+				let componentStr = String(component)
+				let isAllowedFile = allowedDotFiles.contains(componentStr)
+				let isAllowedPrefix = allowedDotPrefixes.contains(where: { componentStr.hasPrefix($0) })
+				guard isAllowedFile || isAllowedPrefix else { return nil }
 			}
 		}
 
