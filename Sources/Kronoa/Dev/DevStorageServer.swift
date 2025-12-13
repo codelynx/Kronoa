@@ -400,9 +400,9 @@ public class DevStorageServer: ObservableObject {
 			return rawData
 		}
 
-		// Extract hash and read from object store
+		// Extract hash and read from object store (contents/objects/<hash>)
 		let hash = String(text.dropFirst("sha256:".count))
-		let objectPath = ".objects/\(hash)"
+		let objectPath = "contents/objects/\(hash)"
 		return try await self.storage.read(path: objectPath)
 	}
 
@@ -460,8 +460,8 @@ public class DevStorageServer: ObservableObject {
 		guard !components.contains("..") else { return nil }
 
 		// Allow known Kronoa dotfiles and metadata prefixes
-		let allowedDotFiles = [".production.json", ".staging.json", ".origin", ".flattened", ".head"]
-		let allowedDotPrefixes = [".catalog", ".objects"]  // Metadata directories and object store
+		let allowedDotFiles = [".production.json", ".staging.json", ".origin", ".flattened", ".head", ".pending"]
+		let allowedDotPrefixes = [".catalog"]  // Metadata directories
 		for component in components {
 			if component.hasPrefix(".") {
 				let componentStr = String(component)
