@@ -400,9 +400,10 @@ public class DevStorageServer: ObservableObject {
 			return rawData
 		}
 
-		// Extract hash and read from object store (contents/objects/<hash>)
+		// Extract hash and read from object store (contents/objects/<prefix>/<hash>.dat)
 		let hash = String(text.dropFirst("sha256:".count))
-		let objectPath = "contents/objects/\(hash)"
+		let prefix = String(hash.prefix(2))
+		let objectPath = "contents/objects/\(prefix)/\(hash).dat"
 		return try await self.storage.read(path: objectPath)
 	}
 
