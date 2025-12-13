@@ -400,11 +400,10 @@ public class DevStorageServer: ObservableObject {
 			return
 		}
 
-		// Build storage path and read
-		let storagePath = "contents/editions/\(editionInfo.edition)/\(validatedPath)"
-
+		// Use ContentSession to read with inheritance support
 		do {
-			let data = try await self.readWithDereference(path: storagePath)
+			let session = try await ContentSession(storage: self.storage, mode: .edition(id: editionInfo.edition))
+			let data = try await session.read(path: validatedPath)
 			let contentType = self.mimeType(for: validatedPath)
 
 			// Determine cache policy
