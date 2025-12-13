@@ -360,7 +360,8 @@ public class DevStorageServer: ObservableObject {
 		}
 
 		do {
-			let data = try await self.storage.read(path: validatedPath)
+			// For edition content paths, dereference the path file
+			let data = try await self.readWithDereference(path: validatedPath)
 			let contentType = self.mimeType(for: validatedPath)
 
 			var extraHeaders = "Content-Type: \(contentType)\r\n"
@@ -374,6 +375,35 @@ public class DevStorageServer: ObservableObject {
 		} catch {
 			self.sendResponse(connection: connection, status: 404, body: self.errorJSON("not_found", "File not found: \(validatedPath)"))
 		}
+	}
+
+	/// Read content with dereferencing for edition paths.
+	/// Edition content uses path files containing "sha256:<hash>" that point to objects.
+	private func readWithDereference(path: String) async throws -> Data {
+		let rawData = try await self.storage.read(path: path)
+
+		// Check if this is an edition content path (not .catalog or metadata)
+		guard path.hasPrefix("contents/editions/") else {
+			return rawData
+		}
+
+		// Skip metadata files (.catalog, .production.json, etc)
+		if path.contains("/.catalog/") || path.hasSuffix(".production.json") || path.hasSuffix(".staging.json") {
+			return rawData
+		}
+
+		// Try to parse as path file (sha256:<hash>)
+		guard rawData.count < 128,
+			  let text = String(data: rawData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+			  text.hasPrefix("sha256:") else {
+			// Not a path file, return as-is
+			return rawData
+		}
+
+		// Extract hash and read from object store
+		let hash = String(text.dropFirst("sha256:".count))
+		let objectPath = ".objects/\(hash)"
+		return try await self.storage.read(path: objectPath)
 	}
 
 	private func handleExists(path: String, connection: NWConnection) async {
@@ -431,7 +461,7 @@ public class DevStorageServer: ObservableObject {
 
 		// Allow known Kronoa dotfiles and metadata prefixes
 		let allowedDotFiles = [".production.json", ".staging.json", ".origin", ".flattened", ".head"]
-		let allowedDotPrefixes = [".catalog"]  // Metadata directories
+		let allowedDotPrefixes = [".catalog", ".objects"]  // Metadata directories and object store
 		for component in components {
 			if component.hasPrefix(".") {
 				let componentStr = String(component)
