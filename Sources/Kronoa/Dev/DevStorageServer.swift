@@ -320,62 +320,188 @@ public class DevStorageServer: ObservableObject {
 		}
 
 		let path = components.path
-		let queryItems = components.queryItems ?? []
 
+		// Label-based API routes
 		switch path {
 		case "/health":
 			let json = #"{"status":"ok","storage":"local"}"#
 			self.sendResponse(connection: connection, status: 200, body: Data(json.utf8), contentType: "application/json")
 
-		case "/storage/read":
-			guard let filePath = queryItems.first(where: { $0.name == "path" })?.value else {
-				self.sendResponse(connection: connection, status: 400, body: self.errorJSON("missing_path", "path parameter required"))
-				return
-			}
-			await self.handleRead(path: filePath, connection: connection)
-
-		case "/storage/exists":
-			guard let filePath = queryItems.first(where: { $0.name == "path" })?.value else {
-				self.sendResponse(connection: connection, status: 400, body: self.errorJSON("missing_path", "path parameter required"))
-				return
-			}
-			await self.handleExists(path: filePath, connection: connection)
-
-		case "/storage/list":
-			let prefix = queryItems.first(where: { $0.name == "prefix" })?.value ?? ""
-			let delimiter = queryItems.first(where: { $0.name == "delimiter" })?.value
-			await self.handleList(prefix: prefix, delimiter: delimiter, connection: connection)
+		case "/labels":
+			await self.handleListLabels(connection: connection)
 
 		default:
-			self.sendResponse(connection: connection, status: 404, body: self.errorJSON("not_found", "Unknown endpoint: \(path)"))
+			// Try /{label}/{path} routing
+			await self.handleLabelPath(path: path, connection: connection)
 		}
 	}
 
-	// MARK: - Request Handlers
+	// MARK: - Label-Based API
 
-	private func handleRead(path: String, connection: NWConnection) async {
-		guard let validatedPath = self.validatePath(path) else {
-			self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_path", "Path validation failed: \(path)"))
+	/// List available labels with their edition IDs and update times.
+	private func handleListLabels(connection: NWConnection) async {
+		do {
+			let labels = try await self.discoverLabels()
+
+			// Build JSON response
+			var labelsJson: [String] = []
+			for (name, info) in labels.sorted(by: { $0.key < $1.key }) {
+				let updatedAt = ISO8601DateFormatter().string(from: info.updatedAt)
+				labelsJson.append(#""\#(name)":{"edition":\#(info.edition),"updatedAt":"\#(updatedAt)"}"#)
+			}
+			let json = "{\"labels\":{\(labelsJson.joined(separator: ","))}}"
+
+			var headers = "Content-Type: application/json\r\n"
+			headers += "Cache-Control: public, max-age=10\r\n"
+			headers += "Content-Length: \(json.utf8.count)\r\n"
+
+			self.sendResponse(connection: connection, status: 200, body: Data(json.utf8), extraHeaders: headers)
+		} catch {
+			self.sendResponse(connection: connection, status: 500, body: self.errorJSON("storage_error", "Failed to list labels: \(error.localizedDescription)"))
+		}
+	}
+
+	/// Handle /{label}/{path} requests.
+	private func handleLabelPath(path: String, connection: NWConnection) async {
+		// Path must start with / and have at least /{label}/{something}
+		guard path.hasPrefix("/") else {
+			self.sendResponse(connection: connection, status: 404, body: self.errorJSON("not_found", "Unknown endpoint"))
 			return
 		}
 
+		let trimmedPath = String(path.dropFirst()) // Remove leading /
+
+		// Split into label and content path
+		guard let slashIndex = trimmedPath.firstIndex(of: "/") else {
+			// Just /{label} with no path
+			self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_path", "Content path required"))
+			return
+		}
+
+		let label = String(trimmedPath[..<slashIndex])
+		let contentPath = String(trimmedPath[trimmedPath.index(after: slashIndex)...])
+
+		// Validate label name (alphanumeric, hyphen, underscore)
+		guard self.isValidLabel(label) else {
+			self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_label", "Invalid label name: \(label)"))
+			return
+		}
+
+		// Validate content path
+		guard let validatedPath = self.validateContentPath(contentPath) else {
+			self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_path", "Path validation failed"))
+			return
+		}
+
+		// Resolve label to edition
+		guard let editionInfo = try? await self.resolveLabel(label) else {
+			let available = (try? await self.discoverLabels().keys.sorted()) ?? []
+			self.sendResponse(connection: connection, status: 404, body: self.labelNotFoundJSON(label: label, available: available))
+			return
+		}
+
+		// Build storage path and read
+		let storagePath = "contents/editions/\(editionInfo.edition)/\(validatedPath)"
+
 		do {
-			// For edition content paths, dereference the path file
-			let data = try await self.readWithDereference(path: validatedPath)
+			let data = try await self.readWithDereference(path: storagePath)
 			let contentType = self.mimeType(for: validatedPath)
 
-			var extraHeaders = "Content-Type: \(contentType)\r\n"
-			extraHeaders += "Content-Length: \(data.count)\r\n"
+			// Determine cache policy
+			let cacheControl = validatedPath.hasPrefix(".catalog/")
+				? "public, max-age=300"
+				: "public, max-age=31536000, immutable"
 
-			// Weak ETag based on size
-			let etag = "W/\"\(data.count)\""
-			extraHeaders += "ETag: \(etag)\r\n"
+			var headers = "Content-Type: \(contentType)\r\n"
+			headers += "Content-Length: \(data.count)\r\n"
+			headers += "Cache-Control: \(cacheControl)\r\n"
+			headers += "X-Edition-Id: \(editionInfo.edition)\r\n"
+			headers += "X-Label: \(label)\r\n"
 
-			self.sendResponse(connection: connection, status: 200, body: data, extraHeaders: extraHeaders)
+			self.sendResponse(connection: connection, status: 200, body: data, extraHeaders: headers)
 		} catch {
-			self.sendResponse(connection: connection, status: 404, body: self.errorJSON("not_found", "File not found: \(validatedPath)"))
+			self.sendResponse(connection: connection, status: 404, body: self.errorJSON("file_not_found", "File not found: \(contentPath)"))
 		}
 	}
+
+	// MARK: - Label Resolution
+
+	private struct LabelInfo {
+		let edition: Int
+		let updatedAt: Date
+	}
+
+	/// Resolve a label name to its edition info.
+	private func resolveLabel(_ label: String) async throws -> LabelInfo {
+		let pointerPath = "contents/.\(label).json"
+		let data = try await self.storage.read(path: pointerPath)
+
+		struct EditionPointer: Decodable {
+			let edition: Int
+		}
+
+		let pointer = try JSONDecoder().decode(EditionPointer.self, from: data)
+
+		// Use current time as updatedAt (file mtime not available via StorageBackend)
+		return LabelInfo(edition: pointer.edition, updatedAt: Date())
+	}
+
+	/// Discover all available labels by scanning for pointer files.
+	private func discoverLabels() async throws -> [String: LabelInfo] {
+		// Known labels to check
+		let knownLabels = ["production", "staging"]
+		var labels: [String: LabelInfo] = [:]
+
+		for label in knownLabels {
+			if let info = try? await self.resolveLabel(label) {
+				labels[label] = info
+			}
+		}
+
+		return labels
+	}
+
+	/// Validate label name (alphanumeric, hyphen, underscore).
+	private func isValidLabel(_ label: String) -> Bool {
+		guard !label.isEmpty else { return false }
+		let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+		return label.unicodeScalars.allSatisfy { allowed.contains($0) }
+	}
+
+	/// Validate content path for label-based access.
+	private func validateContentPath(_ path: String) -> String? {
+		guard !path.isEmpty else { return nil }
+		guard !path.hasPrefix("/") else { return nil }
+
+		let components = path.split(separator: "/", omittingEmptySubsequences: false)
+		guard !components.isEmpty else { return nil }
+
+		// Check for empty components (// in path)
+		guard !components.contains(where: { $0.isEmpty }) else { return nil }
+
+		// Check for path traversal
+		guard !components.contains("..") else { return nil }
+
+		// Allow .catalog/ prefix, reject other dotfiles
+		for (index, component) in components.enumerated() {
+			if component.hasPrefix(".") {
+				// Only allow .catalog at the start
+				if index == 0 && component == ".catalog" {
+					continue
+				}
+				return nil
+			}
+		}
+
+		return components.joined(separator: "/")
+	}
+
+	private func labelNotFoundJSON(label: String, available: [String]) -> Data {
+		let availableStr = available.map { "\"\($0)\"" }.joined(separator: ",")
+		return Data(#"{"error":"label_not_found","label":"\#(label)","message":"Label '\#(label)' is not configured","available":[\#(availableStr)]}"#.utf8)
+	}
+
+	// MARK: - Content Reading
 
 	/// Read content with dereferencing for edition paths.
 	/// Edition content uses path files containing "sha256:<hash>" that point to objects.
@@ -405,74 +531,6 @@ public class DevStorageServer: ObservableObject {
 		let prefix = String(hash.prefix(2))
 		let objectPath = "contents/objects/\(prefix)/\(hash).dat"
 		return try await self.storage.read(path: objectPath)
-	}
-
-	private func handleExists(path: String, connection: NWConnection) async {
-		guard let validatedPath = self.validatePath(path) else {
-			self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_path", "Path validation failed"))
-			return
-		}
-
-		do {
-			let exists = try await self.storage.exists(path: validatedPath)
-			let json = #"{"exists":\#(exists)}"#
-			self.sendResponse(connection: connection, status: 200, body: Data(json.utf8), contentType: "application/json")
-		} catch {
-			let json = #"{"exists":false}"#
-			self.sendResponse(connection: connection, status: 200, body: Data(json.utf8), contentType: "application/json")
-		}
-	}
-
-	private func handleList(prefix: String, delimiter: String?, connection: NWConnection) async {
-		// Validate prefix (allow empty)
-		let validatedPrefix: String
-		if prefix.isEmpty {
-			validatedPrefix = ""
-		} else {
-			guard let validated = self.validatePath(prefix) else {
-				self.sendResponse(connection: connection, status: 400, body: self.errorJSON("invalid_path", "Prefix validation failed: \(prefix)"))
-				return
-			}
-			validatedPrefix = validated
-		}
-
-		do {
-			let files = try await self.storage.list(prefix: validatedPrefix, delimiter: delimiter)
-
-			// Filter results through path validation
-			let filteredFiles = files.filter { self.validatePath($0) != nil }
-
-			let escaped = filteredFiles.map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-			let json = "{\"files\":[\(escaped.joined(separator: ","))]}"
-			self.sendResponse(connection: connection, status: 200, body: Data(json.utf8), contentType: "application/json")
-		} catch {
-			self.sendResponse(connection: connection, status: 500, body: self.errorJSON("internal", "List failed: \(error.localizedDescription)"))
-		}
-	}
-
-	// MARK: - Path Validation
-
-	private func validatePath(_ path: String) -> String? {
-		guard !path.isEmpty else { return nil }
-		guard !path.hasPrefix("/") else { return nil }
-
-		let components = path.split(separator: "/", omittingEmptySubsequences: true)
-		guard !components.isEmpty else { return nil }
-		guard !components.contains("..") else { return nil }
-
-		// Allow known Kronoa dotfiles and metadata prefixes
-		let allowedDotFiles = [".production.json", ".staging.json", ".origin", ".flattened", ".head", ".pending"]
-		let allowedDotPrefixes = [".catalog"]  // Metadata directories
-		for component in components {
-			if component.hasPrefix(".") {
-				let componentStr = String(component)
-				let isAllowedFile = allowedDotFiles.contains(componentStr)
-				let isAllowedPrefix = allowedDotPrefixes.contains(where: { componentStr.hasPrefix($0) })
-				guard isAllowedFile || isAllowedPrefix else { return nil }
-			}
-		}
-
-		return components.joined(separator: "/")
 	}
 
 	// MARK: - Response Helpers
